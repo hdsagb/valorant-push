@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地配置、登录凭证、生成的图片和日志
+data/
+
+dist/
+build/
+*.spec.bak
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

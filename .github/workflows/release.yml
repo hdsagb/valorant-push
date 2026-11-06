@@ -1,0 +1,50 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 构建 exe
+        run: pyinstaller --noconfirm ValorantPushPersonal.spec
+
+      - name: 打包压缩
+        shell: pwsh
+        run: Compress-Archive -Path dist/ValorantPushPersonal.exe -DestinationPath ValorantPushPersonal-windows-x64.zip -Force
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ValorantPushPersonal-windows-x64
+          path: ValorantPushPersonal-windows-x64.zip
+          if-no-files-found: error
+
+      - name: 创建 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME ValorantPushPersonal-windows-x64.zip --title "无畏契约商店推送 $env:GITHUB_REF_NAME" --generate-notes
