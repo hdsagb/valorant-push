@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import cn_client, config, paths, render
+from . import accounts, cn_client, config, paths, render
 from .channels import ChannelError, OutgoingMessage
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -33,47 +33,78 @@ class PushResult:
     fallback_reason: str = ""
 
 
-def build_summary(sections: list[ShopSection], now: datetime | None = None) -> str:
+def build_summary(
+    entries: list[tuple[str, str, list[ShopSection]]],
+    now: datetime | None = None,
+    notes: list[str] | None = None,
+) -> str:
     now = now or datetime.now()
     lines = [f"无畏契约 今日商店 · {now.strftime('%Y-%m-%d')}", ""]
-    for section in sections:
-        title = section.title
-        if section.end_text:
-            title += f"（截止 {section.end_text}）"
-        lines.append(f"【{title}】")
-        for index, item in enumerate(section.items, start=1):
-            lines.append(f"{index}. {item.name} · {item.price_vp} VP")
+    for name, meta, sections in entries:
+        label = name or "账号"
+        if meta:
+            label += f"（{meta}）"
+        lines.append(f"◆ {label}")
+        for section in sections:
+            title = section.title
+            if section.end_text:
+                title += f"（截止 {section.end_text}）"
+            lines.append(f"  【{title}】")
+            for index, item in enumerate(section.items, start=1):
+                lines.append(f"  {index}. {item.name} · {item.price_vp} VP")
         lines.append("")
     lines.append("价格单位：点券（VP）· 个人自用，仅供参考")
+    for note in notes or []:
+        lines.append("")
+        lines.append(note)
     return "\n".join(lines).strip()
 
 
-def build_html(sections: list[ShopSection], has_image: bool) -> str:
+def build_html(
+    entries: list[tuple[str, str, list[ShopSection]]],
+    has_image: bool,
+    notes: list[str] | None = None,
+) -> str:
     blocks: list[str] = []
-    for section in sections:
-        rows = []
-        for index, item in enumerate(section.items, start=1):
-            name = html_lib.escape(item.name)
-            quality = html_lib.escape(item.quality)
-            rows.append(
-                "<tr>"
-                f'<td style="padding:6px 12px;color:#8a9bb0;">{index}</td>'
-                f'<td style="padding:6px 12px;color:#f2f5f8;">{name}'
-                + (f'<span style="color:#8a9bb0;font-size:12px;"> · {quality}</span>' if quality else "")
-                + "</td>"
-                f'<td style="padding:6px 12px;color:#ffe278;text-align:right;">{item.price_vp} VP</td>'
-                "</tr>"
-            )
-        end = f'<span style="color:#8a9bb0;font-size:12px;">截止 {section.end_text}</span>' if section.end_text else ""
-        blocks.append(
-            '<div style="margin:18px 0;">'
-            f'<div style="font-size:16px;font-weight:600;color:#fff;margin-bottom:8px;">'
-            f"{html_lib.escape(section.title)} {end}</div>"
-            '<table style="border-collapse:collapse;font-size:14px;width:100%;">'
-            + "".join(rows)
-            + "</table></div>"
+    for name, meta, sections in entries:
+        meta_html = (
+            f'<span style="color:#8a9bb0;font-size:12px;margin-left:8px;">{html_lib.escape(meta)}</span>'
+            if meta
+            else ""
         )
+        blocks.append(
+            '<div style="margin:22px 0 6px;padding-left:10px;border-left:3px solid #ff4655;">'
+            f'<span style="color:#fff;font-size:17px;font-weight:700;">{html_lib.escape(name or "账号")}</span>'
+            f"{meta_html}</div>"
+        )
+        for section in sections:
+            rows = []
+            for index, item in enumerate(section.items, start=1):
+                item_name = html_lib.escape(item.name)
+                quality = html_lib.escape(item.quality)
+                rows.append(
+                    "<tr>"
+                    f'<td style="padding:6px 12px;color:#8a9bb0;">{index}</td>'
+                    f'<td style="padding:6px 12px;color:#f2f5f8;">{item_name}'
+                    + (f'<span style="color:#8a9bb0;font-size:12px;"> · {quality}</span>' if quality else "")
+                    + "</td>"
+                    f'<td style="padding:6px 12px;color:#ffe278;text-align:right;">{item.price_vp} VP</td>'
+                    "</tr>"
+                )
+            end = f'<span style="color:#8a9bb0;font-size:12px;">截止 {section.end_text}</span>' if section.end_text else ""
+            blocks.append(
+                '<div style="margin:18px 0;">'
+                f'<div style="font-size:16px;font-weight:600;color:#fff;margin-bottom:8px;">'
+                f"{html_lib.escape(section.title)} {end}</div>"
+                '<table style="border-collapse:collapse;font-size:14px;width:100%;">'
+                + "".join(rows)
+                + "</table></div>"
+            )
 
+    note_html = "".join(
+        f'<div style="color:#ffb84d;font-size:13px;margin-top:10px;">{html_lib.escape(note)}</div>'
+        for note in notes or []
+    )
     image_html = (
         '<img src="cid:shopimage" alt="商店图片" '
         'style="width:100%;max-width:736px;border-radius:12px;display:block;margin:12px 0;">'
@@ -88,15 +119,16 @@ def build_html(sections: list[ShopSection], has_image: bool) -> str:
         '<div style="color:#fff;font-size:22px;font-weight:700;margin-top:4px;">今日商店</div>'
         f"{image_html}"
         + "".join(blocks)
+        + note_html
         + '<div style="color:#5d6d7e;font-size:12px;margin-top:16px;">'
         "价格单位：点券（VP）· 个人自用，仅供参考</div></div>"
     )
 
 
-async def _notify_expired(settings: dict[str, Any]) -> None:
+async def _notify_expired(settings: dict[str, Any], names: list[str]) -> None:
     text = (
-        "无畏契约登录凭证已失效，今日推送已暂停。\n"
-        "请打开「无畏契约商店推送」托盘菜单 → 打开设置面板，重新扫码登录。"
+        f"以下账号的登录凭证已失效：{'、'.join(names)}。\n"
+        "今日推送已暂停。请打开「无畏契约商店推送」托盘菜单 → 打开设置面板，重新扫码登录。"
     )
     message = OutgoingMessage(subject="无畏契约商店推送 · 需要重新登录", text=text, html="")
     for channel in (settings["channel"], "email" if settings["channel"] == "wecom" else "wecom"):
@@ -153,41 +185,77 @@ async def run_push(trigger: str = "manual") -> PushResult:
     settings = config.load_settings()
     now = datetime.now()
 
-    if not config.has_credentials():
-        raise LoginRequired("尚未登录，请先在设置面板扫码登录")
+    account_list = accounts.all()
+    if not account_list:
+        raise LoginRequired("尚未绑定账号，请先在设置面板扫码登录")
 
-    credentials = cn_client.load_credentials()
-    if not credentials:
-        raise LoginRequired("登录凭证不存在，请重新扫码登录")
+    entries: list[tuple[str, str, list[ShopSection]]] = []
+    expired: list[str] = []
+    failed: list[str] = []
+    for account in account_list:
+        name = account.get("name") or "账号"
+        try:
+            response = await cn_client.fetch_response(account.get("credentials") or {})
+        except cn_client.AuthExpiredError as exc:
+            accounts.mark_expired(account.get("id", ""), True)
+            expired.append(name)
+            logger.warning("账号「%s」登录凭证已失效：%s", name, exc)
+            continue
+        except Exception as exc:
+            failed.append(f"{name}（{exc}）")
+            logger.warning("账号「%s」获取商店失败：%s", name, exc)
+            continue
 
-    try:
-        response = await cn_client.fetch_response(credentials)
-    except cn_client.AuthExpiredError as exc:
-        config.clear_credentials()
+        accounts.mark_expired(account.get("id", ""), False)
+        sections = cn_client.parse_sections(response, settings["sections"])
+        if not sections:
+            failed.append(f"{name}（今天没有获取到商店商品）")
+            continue
+        meta = accounts.mask_user_id(str(account.get("user_id") or ""))
+        entries.append((name, meta, sections))
+
+    if not entries:
+        error_text = "；".join(
+            [f"{name}：登录凭证已失效" for name in expired]
+            + failed
+        ) or "没有获取到任何商店商品"
         config.update_state(
-            auth_expired=True,
+            auth_expired=bool(expired) and len(expired) == len(account_list),
             last_push_at=now.strftime("%Y-%m-%d %H:%M:%S"),
             last_push_ok=False,
-            last_error=str(exc),
+            last_error=f"所有账号均推送失败：{error_text}",
         )
-        await _notify_expired(settings)
-        raise LoginRequired(f"{exc}，请重新扫码登录") from exc
+        if expired:
+            await _notify_expired(settings, expired)
+        if len(expired) == len(account_list):
+            raise LoginRequired("所有账号的登录凭证均已失效，请重新扫码登录")
+        raise RuntimeError(f"获取商店失败：{error_text}")
 
-    sections = cn_client.parse_sections(response, settings["sections"])
-    if not sections:
-        raise RuntimeError("今天没有获取到任何商店商品，请稍后再试")
+    notes: list[str] = []
+    if expired:
+        notes.append(f"注意：以下账号的登录凭证已失效，本次未推送：{'、'.join(expired)}。请重新扫码登录。")
+    if failed:
+        notes.append(f"注意：以下账号本次获取失败：{'、'.join(failed)}。")
 
-    image_path = await render.render_sections(sections)
-    summary = build_summary(sections, now)
-    subject = f"无畏契约 · {now.strftime('%m-%d')} 商店"
+    image_path = await render.render_accounts(entries)
+    summary = build_summary(entries, now, notes)
+    if len(entries) == 1:
+        subject = f"无畏契约 · {now.strftime('%m-%d')} 商店 · {entries[0][0]}"
+    else:
+        subject = f"无畏契约 · {now.strftime('%m-%d')} 商店（{len(entries)} 个账号）"
     message = OutgoingMessage(
         subject=subject,
         text=summary,
-        html=build_html(sections, has_image=True),
+        html=build_html(entries, has_image=True, notes=notes),
         image=image_path,
     )
 
-    logger.info("开始推送（触发方式：%s，渠道：%s）", trigger, settings["channel"])
+    logger.info(
+        "开始推送（触发方式：%s，渠道：%s，账号数：%s）",
+        trigger,
+        settings["channel"],
+        len(entries),
+    )
     channel, fallback_reason = await _deliver(settings, message)
     if fallback_reason:
         logger.warning(fallback_reason)

@@ -1,6 +1,7 @@
 """本地配置与运行状态读写。
 
-配置放在 data/settings.json；登录凭证由 app/config.json 单独保存（vendored 脚本维护）。
+配置放在 data/settings.json，运行状态放在 data/state.json；
+登录凭证由 app/accounts.py 保存到 data/accounts.json。
 所有读写都做默认值合并，保证升级后新增字段不会让程序崩溃。
 """
 from __future__ import annotations
@@ -202,32 +203,6 @@ def validate(settings: dict[str, Any]) -> list[str]:
         if not wecom["secret"]:
             problems.append("请填写应用 Secret")
     return problems
-
-
-# ---------- 登录凭证 ----------
-
-
-def has_credentials() -> bool:
-    data = _read_json(paths.CREDENTIALS_FILE, {})
-    return bool(data.get("userId") and data.get("tid"))
-
-
-def credential_summary() -> dict[str, Any]:
-    data = _read_json(paths.CREDENTIALS_FILE, {})
-    user_id = str(data.get("userId") or "")
-    return {
-        "logged_in": bool(user_id and data.get("tid")),
-        "login_type": data.get("login_type") or "",
-        "user_id_masked": (user_id[:3] + "***" + user_id[-3:]) if len(user_id) > 8 else user_id,
-    }
-
-
-def clear_credentials() -> None:
-    try:
-        paths.CREDENTIALS_FILE.unlink(missing_ok=True)
-        logger.warning("登录凭证已失效并被清除")
-    except OSError as exc:
-        logger.error("清除登录凭证失败：%s", exc)
 
 
 # ---------- 运行状态 ----------

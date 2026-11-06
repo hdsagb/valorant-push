@@ -11,7 +11,7 @@ from typing import Any
 
 from aiohttp import web
 
-from . import __version__, config, login, paths, pipeline, scheduler
+from . import __version__, accounts, config, login, paths, pipeline, scheduler
 from .channels import ChannelError
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -37,12 +37,18 @@ async def local_only(request: web.Request, handler):
 def _masked_status() -> dict[str, Any]:
     settings = config.load_settings()
     state = config.load_state()
-    credentials = config.credential_summary()
+    account_list = accounts.summary()
+    account_count = len(account_list)
+    expired_names = [item["name"] for item in account_list if item["auth_expired"]]
+    logged_in = account_count > 0
+    auth_expired = bool(account_count) and len(expired_names) == account_count
+    single = account_list[0] if account_count == 1 else None
+
     next_push = scheduler.next_run(settings, state)
     now = datetime.now(zone())
     if next_push is None:
         next_run_text = ""
-    elif not credentials["logged_in"]:
+    elif not logged_in:
         next_run_text = "登录后开始"
     elif state["last_push_date"] != now.strftime("%Y-%m-%d") and next_push <= now:
         next_run_text = "即将补推"
@@ -50,10 +56,14 @@ def _masked_status() -> dict[str, Any]:
         next_run_text = next_push.strftime("%m-%d %H:%M")
     return {
         "version": __version__,
-        "logged_in": credentials["logged_in"],
-        "login_type": credentials["login_type"],
-        "user_id_masked": credentials["user_id_masked"],
-        "auth_expired": bool(state["auth_expired"]),
+        "logged_in": logged_in,
+        "login_type": (single["login_type"] if single else ("multi" if account_count > 1 else "")),
+        "user_id_masked": single["user_id_masked"] if single else "",
+        "accounts": account_list,
+        "account_count": account_count,
+        "account_limit": accounts.MAX_ACCOUNTS,
+        "expired_accounts": expired_names,
+        "auth_expired": auth_expired,
         "channel": settings["channel"],
         "email_configured": config.email_configured(settings),
         "wecom_configured": config.wecom_configured(settings),
@@ -90,6 +100,44 @@ async def index(_: web.Request) -> web.Response:
 @routes.get("/api/status")
 async def api_status(_: web.Request) -> web.Response:
     return web.json_response(_masked_status())
+
+
+@routes.get("/api/accounts")
+async def api_accounts(_: web.Request) -> web.Response:
+    items = accounts.summary()
+    return web.json_response(
+        {
+            "ok": True,
+            "accounts": items,
+            "count": len(items),
+            "limit": accounts.MAX_ACCOUNTS,
+        }
+    )
+
+
+@routes.post("/api/accounts/rename")
+async def api_accounts_rename(request: web.Request) -> web.Response:
+    body = await request.json()
+    account = accounts.rename(str(body.get("id") or ""), str(body.get("name") or ""))
+    if not account:
+        return web.json_response({"ok": False, "message": "账号不存在，可能已被解绑"}, status=404)
+    return web.json_response(
+        {"ok": True, "message": f"已改名为「{account['name']}」", "name": account["name"]}
+    )
+
+
+@routes.post("/api/accounts/remove")
+async def api_accounts_remove(request: web.Request) -> web.Response:
+    body = await request.json()
+    account_id = str(body.get("id") or "")
+    if not accounts.remove(account_id):
+        return web.json_response({"ok": False, "message": "账号不存在，可能已被解绑"}, status=404)
+    remaining = accounts.count()
+    if remaining == 0:
+        config.update_state(auth_expired=False)
+    return web.json_response(
+        {"ok": True, "message": "已解绑该账号", "count": remaining}
+    )
 
 
 @routes.get("/api/settings")
@@ -167,6 +215,14 @@ async def api_qr(_: web.Request) -> web.StreamResponse:
     return response
 
 
+@routes.get("/api/public-ip")
+async def api_public_ip(_: web.Request) -> web.Response:
+    ip = await wecom_channel.detect_public_ip()
+    if not ip:
+        return web.json_response({"ok": False, "message": "检测失败，请检查网络后重试"}, status=502)
+    return web.json_response({"ok": True, "ip": ip, "masked": wecom_channel.mask_ip(ip)})
+
+
 @routes.post("/api/push-now")
 async def api_push_now(_: web.Request) -> web.Response:
     try:
@@ -176,7 +232,7 @@ async def api_push_now(_: web.Request) -> web.Response:
     except ChannelError as exc:
         payload: dict[str, Any] = {"ok": False, "message": exc.message, "code": exc.code}
         if exc.code == 60020:
-            payload["can_fallback"] = config.email_configured()
+            payload["can_fallback"] = config.email_configured(config.load_settings())
         return web.json_response(payload, status=400)
     except Exception as exc:
         logger.exception("手动推送失败")
@@ -310,6 +366,13 @@ INDEX_HTML = r'''<!doctype html>
   .tag{font-size:10px;color:var(--accent);border:1px solid rgba(255,70,85,.4);border-radius:6px;padding:2px 6px}
   .hint{color:var(--sub);font-size:12px;margin:6px 0 14px}
   .hint.warn{color:#ffc46b}
+  .ip-row{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 6px;padding:10px 12px;
+    border-radius:10px;background:#0e1822;border:1px solid var(--line)
+  }
+  .ip-row .ip-label{color:var(--sub);font-size:12px}
+  .ip-row code{font-family:ui-monospace,Consolas,monospace;font-size:13px;letter-spacing:.5px}
+  .ip-row button{padding:5px 12px;font-size:12px}
   .seg{display:flex;background:#0e1822;border:1px solid var(--line);border-radius:10px;padding:3px;margin-bottom:14px}
   .seg button{
     flex:1;background:none;border:none;color:var(--sub);padding:8px 6px;border-radius:8px;
@@ -341,6 +404,34 @@ INDEX_HTML = r'''<!doctype html>
   .qrbox img{width:190px;height:190px;background:#fff;border-radius:12px;padding:8px}
   .qrbox p{margin:0;color:var(--sub);font-size:12px;text-align:center}
   .account{margin:12px 0 0;color:var(--sub);font-size:12px}
+  .acc-list{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .acc-item{
+    display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;
+    background:#0e1822;border:1px solid var(--line)
+  }
+  .acc-main{flex:1;min-width:0}
+  .acc-name{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600}
+  .acc-meta{color:var(--sub);font-size:11px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .acc-item button{
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);border-radius:8px;
+    padding:5px 10px;font-size:12px;font-family:inherit;cursor:pointer;flex:none
+  }
+  .acc-item button:hover{border-color:#3c5166}
+  .acc-item button.danger{color:var(--err);border-color:rgba(255,107,107,.35)}
+  .tag-expired{color:var(--err);border:1px solid rgba(255,107,107,.4);border-radius:6px;padding:1px 6px;font-size:10px;font-weight:400}
+  .acc-empty{
+    color:var(--sub);font-size:12px;text-align:center;padding:16px;border:1px dashed var(--line);border-radius:12px
+  }
+  .modal{
+    position:fixed;inset:0;background:rgba(6,12,18,.72);display:flex;align-items:center;
+    justify-content:center;padding:20px;z-index:30
+  }
+  .modal-box{
+    width:100%;max-width:380px;background:var(--panel);border:1px solid var(--line);
+    border-radius:16px;padding:22px;box-shadow:0 20px 50px rgba(0,0,0,.5)
+  }
+  .modal-box h3{margin:0 0 6px;font-size:16px}
+  .modal-box input{margin-top:10px}
   .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid rgba(38,56,74,.6)}
   .switch:first-of-type{border-top:none}
   .switch .label{font-size:13px}
@@ -417,7 +508,13 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>2 · 选择推送渠道</h2>
+      <h2>2 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
+      <p class="hint">最多可绑定 10 个账号。推送时会合并成一条消息，并按账号名分区，方便区分。</p>
+      <div class="acc-list" id="accList"><div class="acc-empty">还没有绑定账号</div></div>
+    </section>
+
+    <section class="card">
+      <h2>3 · 选择推送渠道</h2>
       <div class="seg" id="channelTabs">
         <button data-channel="email" class="active">邮件（推荐）</button>
         <button data-channel="wecom">企业微信</button>
@@ -451,6 +548,14 @@ INDEX_HTML = r'''<!doctype html>
         </div>
         <label class="field"><span>应用 Secret</span><input id="w_secret" type="password" placeholder="应用 Secret"></label>
         <label class="field"><span>接收人（userid，多个用 | 分隔）</span><input id="w_touser" placeholder="@all"></label>
+        <div class="ip-row">
+          <span class="ip-label">本机出口 IP</span>
+          <code id="publicIp">未检测</code>
+          <button class="action" id="ipCopy" disabled>复制</button>
+          <button class="action" id="ipRefresh">重新检测</button>
+          <span class="inline-msg" id="ipMsg"></span>
+        </div>
+        <p class="hint">点「复制」得到完整 IP，粘贴到企业微信后台「应用管理 → 自建应用 → 企业可信 IP」。页面上只做打码显示，完整地址只写入剪贴板。</p>
         <p class="hint warn">自建应用要求把本机出口 IP 加入「企业可信 IP」。家用宽带 IP 变化时会返回 60020，程序会自动改用邮件（需同时配置邮件）。</p>
       </div>
 
@@ -461,7 +566,7 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>3 · 推送设置</h2>
+      <h2>4 · 推送设置</h2>
       <label class="field" style="max-width:180px"><span>每天推送时间</span><input id="pushTime" type="time"></label>
       <div class="checks">
         <label><input type="checkbox" id="secDaily" checked>每日商店</label>
@@ -485,12 +590,24 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>4 · 立即推送</h2>
+      <h2>5 · 立即推送</h2>
       <p class="hint">先保存设置并测试渠道，成功后可以立刻推送一次确认效果。</p>
       <button class="action primary" id="pushBtn">现在推送一次</button>
       <div class="last" id="lastBox">暂无推送记录</div>
       <div class="preview hidden" id="previewBox"><img id="previewImg" alt="商店图片"></div>
     </section>
+  </div>
+</div>
+
+<div class="modal hidden" id="nameModal">
+  <div class="modal-box">
+    <h3 id="nameModalTitle">给账号起个名字</h3>
+    <p class="hint" id="nameModalHint">推送消息里会用这个名字区分账号，例如「大号」「小号」。</p>
+    <input id="nameInput" maxlength="24" placeholder="账号1">
+    <div class="row" style="justify-content:flex-end;margin-top:16px">
+      <button class="action" id="nameCancel">取消</button>
+      <button class="action primary" id="nameOk">保存</button>
+    </div>
   </div>
 </div>
 
@@ -501,9 +618,48 @@ INDEX_HTML = r'''<!doctype html>
 <div class="toast" id="toast"></div>
 
 <script>
-const state = { channel: 'email', loginMethod: 'qq', status: null, qrKey: '', poll: null };
+const state = { channel: 'email', loginMethod: 'qq', status: null, qrKey: '', poll: null, nameTarget: null, accountPromptKey: '', publicIp: '' };
 const $ = (id) => document.getElementById(id);
 const val = (id) => ($(id) ? $(id).value.trim() : '');
+
+// 常见邮箱的 SMTP 预设：填完发件邮箱后自动补齐服务器 / 端口 / 加密方式
+const SMTP_GUESS = {
+  'qq.com': ['smtp.qq.com', 465, 'ssl'],
+  'foxmail.com': ['smtp.qq.com', 465, 'ssl'],
+  '163.com': ['smtp.163.com', 465, 'ssl'],
+  '126.com': ['smtp.126.com', 465, 'ssl'],
+  'yeah.net': ['smtp.yeah.net', 465, 'ssl'],
+  'gmail.com': ['smtp.gmail.com', 587, 'starttls'],
+  'googlemail.com': ['smtp.gmail.com', 587, 'starttls'],
+  'outlook.com': ['smtp.office365.com', 587, 'starttls'],
+  'hotmail.com': ['smtp.office365.com', 587, 'starttls'],
+  'live.com': ['smtp.office365.com', 587, 'starttls'],
+  'sina.com': ['smtp.sina.com', 465, 'ssl'],
+  'aliyun.com': ['smtp.aliyun.com', 465, 'ssl'],
+  '139.com': ['smtp.139.com', 465, 'ssl'],
+  '189.cn': ['smtp.189.cn', 465, 'ssl']
+};
+let autoHost = '';
+
+function smtpPreset(address) {
+  const at = address.lastIndexOf('@');
+  if (at < 0) return null;
+  const domain = address.slice(at + 1).trim().toLowerCase();
+  if (!domain || domain.indexOf('.') < 0) return null;
+  return SMTP_GUESS[domain] || ['smtp.' + domain, 465, 'ssl'];
+}
+
+function applySmtpPreset() {
+  const preset = smtpPreset(val('e_user'));
+  if (!preset) return;
+  const current = val('e_host');
+  // 只覆盖空值或上一次自动填写的值，用户手填的不动
+  if (current && current !== autoHost) return;
+  $('e_host').value = preset[0];
+  $('e_port').value = preset[1];
+  $('e_security').value = preset[2];
+  autoHost = preset[0];
+}
 
 function toast(message, kind) {
   const el = $('toast');
@@ -554,11 +710,18 @@ function fillSettings(s) {
   $('e_security').value = s.email.security || 'ssl';
   $('e_name').value = s.email.from_name || '';
 
+  // 已保存的服务器如果正好是自动匹配的值，就继续跟随邮箱域名变化
+  const preset = smtpPreset(s.email.username || '');
+  autoHost = preset && preset[0] === (s.email.smtp_host || '') ? preset[0] : '';
+  if (!s.email.smtp_host) applySmtpPreset();
+
   $('w_corpid').value = s.wecom.corpid || '';
   $('w_agentid').value = s.wecom.agentid || '';
   $('w_secret').value = '';
   $('w_secret').placeholder = s.wecom.secret_set ? '已保存，留空保持不变' : '应用 Secret';
   $('w_touser').value = s.wecom.touser || '@all';
+
+  if (state.channel === 'wecom') detectPublicIp(false);
 
   const hh = String(s.push_hour).padStart(2, '0');
   const mm = String(s.push_minute).padStart(2, '0');
@@ -612,17 +775,23 @@ function renderStatus(s) {
     pill.className = 'pill warn';
   }
 
-  $('statLogin').textContent = s.logged_in
-    ? (s.login_type === 'wechat' ? '微信' : 'QQ') + ' · ' + s.user_id_masked
-    : '未登录';
   $('statNext').textContent = s.schedule_enabled ? (s.next_run || '明日') : '已关闭';
   $('statLast').textContent = s.last_push_at
     ? s.last_push_at + (s.last_push_ok ? ' 成功' : ' 失败')
     : '暂无记录';
 
-  $('accountLine').textContent = s.logged_in
-    ? '当前账号：' + s.user_id_masked + '（凭证保存在本机）'
-    : '尚未登录。扫码后即可获取商店数据。';
+  const count = s.account_count || 0;
+  const limit = s.account_limit || 10;
+  $('statLogin').textContent = count
+    ? count + ' 个账号' + (s.expired_accounts && s.expired_accounts.length
+        ? '（' + s.expired_accounts.length + ' 个失效）' : '')
+    : '未登录';
+  $('accCount').textContent = count + '/' + limit;
+  renderAccounts(s.accounts || []);
+
+  $('accountLine').textContent = count
+    ? '已绑定 ' + count + ' 个账号，凭证只保存在本机 data 目录。'
+    : '尚未登录。扫码后即可获取商店数据，最多可绑定 ' + limit + ' 个账号。';
 
   $('autoStart').checked = !!s.autostart;
 
@@ -630,6 +799,8 @@ function renderStatus(s) {
   const lines = [];
   if (s.auth_expired) {
     lines.push('登录已失效：每日推送会暂停，请重新扫码登录。');
+  } else if (s.expired_accounts && s.expired_accounts.length) {
+    lines.push('以下账号登录已失效，推送时会跳过：' + s.expired_accounts.join('、'));
   }
   if (s.last_error) {
     lines.push('最近一次错误：' + s.last_error);
@@ -643,6 +814,111 @@ function renderStatus(s) {
       ' · ' + (s.last_channel === 'wecom' ? '企业微信' : '邮件') + '\n\n' + s.last_summary;
   } else if (s.last_error) {
     box.textContent = s.last_error;
+  }
+}
+
+function renderAccounts(list) {
+  const box = $('accList');
+  box.innerHTML = '';
+  if (!list || !list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'acc-empty';
+    empty.textContent = '还没有绑定账号';
+    box.appendChild(empty);
+    return;
+  }
+
+  list.forEach((acc) => {
+    const item = document.createElement('div');
+    item.className = 'acc-item';
+
+    const main = document.createElement('div');
+    main.className = 'acc-main';
+    const nameRow = document.createElement('div');
+    nameRow.className = 'acc-name';
+    nameRow.textContent = acc.name || '账号';
+    if (acc.auth_expired) {
+      const tag = document.createElement('span');
+      tag.className = 'tag-expired';
+      tag.textContent = '登录已失效';
+      nameRow.appendChild(tag);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'acc-meta';
+    meta.textContent = (acc.login_type === 'wechat' ? '微信' : 'QQ') + ' · ' + acc.user_id_masked +
+      (acc.added_at ? ' · 绑定于 ' + acc.added_at : '');
+    main.appendChild(nameRow);
+    main.appendChild(meta);
+
+    const renameBtn = document.createElement('button');
+    renameBtn.textContent = '改名';
+    renameBtn.addEventListener('click', () => openNameModal(acc, false));
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'danger';
+    removeBtn.textContent = '解绑';
+    removeBtn.addEventListener('click', () => removeAccount(acc));
+
+    item.appendChild(main);
+    item.appendChild(renameBtn);
+    item.appendChild(removeBtn);
+    box.appendChild(item);
+  });
+}
+
+function openNameModal(account, isNew) {
+  state.nameTarget = account;
+  if (isNew && account.id) sessionStorage.setItem('valpush_named_' + account.id, '1');
+  $('nameModalTitle').textContent = isNew ? '给账号起个名字' : '修改账号名';
+  $('nameModalHint').textContent = isNew
+    ? '推送消息里会用这个名字区分账号，例如「大号」「小号」。'
+    : '改名后，下次推送就会使用新名字。';
+  $('nameInput').value = account.name || '';
+  $('nameModal').classList.remove('hidden');
+  $('nameInput').focus();
+  $('nameInput').select();
+}
+
+function closeNameModal() {
+  state.nameTarget = null;
+  $('nameModal').classList.add('hidden');
+}
+
+async function commitName() {
+  const target = state.nameTarget;
+  if (!target) return;
+  const name = val('nameInput');
+  if (!name) {
+    toast('账号名不能为空', 'err');
+    return;
+  }
+  $('nameOk').disabled = true;
+  try {
+    const res = await api('/api/accounts/rename', {
+      method: 'POST',
+      body: JSON.stringify({ id: target.id, name: name })
+    });
+    closeNameModal();
+    toast(res.message || '已保存', 'ok');
+    await loadAll();
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    $('nameOk').disabled = false;
+  }
+}
+
+async function removeAccount(account) {
+  if (!confirm('确定解绑「' + (account.name || '账号') + '」吗？\n解绑后需要重新扫码才能恢复。')) return;
+  try {
+    const res = await api('/api/accounts/remove', {
+      method: 'POST',
+      body: JSON.stringify({ id: account.id })
+    });
+    toast(res.message || '已解绑', 'ok');
+    await loadAll();
+  } catch (err) {
+    toast(err.message, 'err');
   }
 }
 
@@ -682,6 +958,42 @@ function switchChannel(channel) {
   });
   $('emailPane').classList.toggle('hidden', channel !== 'email');
   $('wecomPane').classList.toggle('hidden', channel !== 'wecom');
+  if (channel === 'wecom') detectPublicIp(false);
+}
+
+// 检测本机出口 IP：页面只显示打码结果，完整地址留在内存里供「复制」使用
+async function detectPublicIp(force) {
+  if (state.publicIp && !force) return;
+  $('publicIp').textContent = '检测中…';
+  $('ipCopy').disabled = true;
+  setMsg('ipMsg', '');
+  try {
+    const res = await api('/api/public-ip');
+    state.publicIp = res.ip;
+    $('publicIp').textContent = res.masked;
+    $('ipCopy').disabled = false;
+  } catch (err) {
+    state.publicIp = '';
+    $('publicIp').textContent = '检测失败';
+    setMsg('ipMsg', err.message, 'err');
+  }
+}
+
+async function copyPublicIp() {
+  if (!state.publicIp) return;
+  try {
+    await navigator.clipboard.writeText(state.publicIp);
+  } catch (err) {
+    const area = document.createElement('textarea');
+    area.value = state.publicIp;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand('copy');
+    document.body.removeChild(area);
+  }
+  setMsg('ipMsg', '已复制完整 IP', 'ok');
 }
 
 async function testChannel() {
@@ -698,6 +1010,7 @@ async function testChannel() {
     const data = err.data || {};
     setMsg('testMsg', err.message, 'err');
     if (data.code === 60020) {
+      detectPublicIp(true);
       switchChannel('email');
       toast('企业微信返回 60020（可信 IP 不匹配），已切换到邮件渠道。\n请填写邮件配置后保存。', 'err');
       return;
@@ -752,9 +1065,17 @@ function applyLogin(snapshot) {
     stopPolling();
     $('qrMsg').textContent = '登录成功';
     $('loginBtn').disabled = false;
-    toast('登录成功', 'ok');
+    const account = snapshot.account;
+    const key = account ? account.id + ':' + (account.updated ? '1' : '0') : '';
+    toast(snapshot.message || '登录成功', 'ok');
     setTimeout(() => $('qrBox').classList.add('hidden'), 1500);
-    loadAll();
+    if (account && key !== state.accountPromptKey) {
+      state.accountPromptKey = key;
+      const skip = account.updated || sessionStorage.getItem('valpush_named_' + account.id);
+      loadAll().then(() => { if (!skip) openNameModal(account, true); });
+    } else {
+      loadAll();
+    }
   } else if (snapshot.state === 'failed' || snapshot.state === 'timeout') {
     stopPolling();
     $('qrMsg').textContent = snapshot.message || '登录失败';
@@ -802,8 +1123,27 @@ $('channelTabs').addEventListener('click', (e) => {
   switchChannel(btn.dataset.channel);
 });
 
+$('e_user').addEventListener('input', applySmtpPreset);
+$('e_user').addEventListener('change', applySmtpPreset);
+
 $('loginBtn').addEventListener('click', startLogin);
+
+$('nameOk').addEventListener('click', commitName);
+$('nameCancel').addEventListener('click', closeNameModal);
+$('nameInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    commitName();
+  } else if (e.key === 'Escape') {
+    closeNameModal();
+  }
+});
+$('nameModal').addEventListener('click', (e) => {
+  if (e.target === $('nameModal')) closeNameModal();
+});
 $('testBtn').addEventListener('click', testChannel);
+$('ipRefresh').addEventListener('click', () => detectPublicIp(true));
+$('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
 $('pushBtn').addEventListener('click', pushNow);
 

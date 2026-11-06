@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from . import config, pipeline
+from . import accounts, config, pipeline
 from .models import zone
 
 logger = logging.getLogger(__name__)
@@ -52,9 +52,9 @@ async def tick(now: datetime | None = None) -> None:
     settings = config.load_settings()
     state = config.load_state()
 
-    if not settings.get("schedule_enabled") or state.get("auth_expired"):
+    if not settings.get("schedule_enabled") or accounts.all_expired():
         return
-    if not config.has_credentials():
+    if accounts.count() == 0:
         return
 
     now = now or datetime.now(zone())

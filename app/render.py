@@ -21,6 +21,7 @@ GAP = 14
 CARD_W = (WIDTH - PADDING * 2 - GAP) // 2
 CARD_H = 220
 TITLE_H = 78
+ACCOUNT_H = 58
 SECTION_H = 46
 FOOTER_H = 40
 
@@ -186,7 +187,7 @@ def _render_card(
     return _round_corners(card)
 
 
-def _render_title(count: int, date_text: str) -> Image.Image:
+def _render_title(count: int, date_text: str, account_count: int = 1) -> Image.Image:
     header = Image.new("RGBA", (WIDTH, TITLE_H), BACKGROUND + (255,))
     draw = ImageDraw.Draw(header)
 
@@ -199,10 +200,34 @@ def _render_title(count: int, date_text: str) -> Image.Image:
     )
 
     sub_text = f"{date_text} · {count} 件"
+    if account_count > 1:
+        sub_text = f"{date_text} · {account_count} 个账号 · {count} 件"
     sub_w = int(draw.textlength(sub_text, font=_font(17)))
     draw.text((WIDTH - sub_w - PADDING, 30), sub_text, font=_font(17), fill=TEXT_SUB)
 
     draw.rectangle((0, TITLE_H - 3, WIDTH, TITLE_H), fill=ACCENT)
+    return header
+
+
+def _render_account_header(name: str, meta: str, first: bool) -> Image.Image:
+    """账号分区标题：名字 + 脱敏账号 ID。"""
+    header = Image.new("RGBA", (WIDTH, ACCOUNT_H), BACKGROUND + (255,))
+    draw = ImageDraw.Draw(header)
+
+    if not first:
+        draw.line((PADDING, 6, WIDTH - PADDING, 6), fill=(38, 56, 74), width=1)
+
+    top = 14 if not first else 6
+    draw.rounded_rectangle((PADDING, top + 8, PADDING + 5, top + 32), 2, fill=ACCENT)
+    draw.text(
+        (PADDING + 16, top + 1),
+        _fit_text(draw, name, _font(24, bold=True), WIDTH - PADDING * 2 - 200),
+        font=_font(24, bold=True),
+        fill=TEXT_MAIN,
+    )
+    if meta:
+        meta_w = int(draw.textlength(meta, font=_font(15)))
+        draw.text((WIDTH - meta_w - PADDING, top + 10), meta, font=_font(15), fill=TEXT_SUB)
     return header
 
 
@@ -221,33 +246,37 @@ def _render_section_header(section: ShopSection) -> Image.Image:
     return header
 
 
-async def render_sections(
-    sections: list[ShopSection],
+async def render_accounts(
+    entries: list[tuple[str, str, list[ShopSection]]],
     date_text: str | None = None,
     out_dir: Path | None = None,
 ) -> Path:
-    """把每日商店、王国商店渲染到同一张图，返回图片路径。"""
+    """把多个账号的商店渲染到同一张图，账号名作为分区标题。
+
+    entries 为 (账号名, 脱敏账号 ID, 商店区块)；账号名为空时不画账号标题。
+    """
     paths.ensure_dirs()
     date_text = date_text or datetime.now().strftime("%Y-%m-%d")
     out_dir = out_dir or paths.OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 每个区块最多 2×2 的商品图，多出来的继续按两列排
-    flat: list[tuple[ShopSection, int, ShopItem]] = []
-    for section in sections:
-        for index, item in enumerate(section.items):
-            flat.append((section, index, item))
+    flat: list[tuple[int, ShopSection, int, ShopItem]] = []
+    for entry_index, (_, _, sections) in enumerate(entries):
+        for section in sections:
+            for index, item in enumerate(section.items):
+                flat.append((entry_index, section, index, item))
 
     bg_paths: list[Path] = []
     goods_paths: list[Path] = []
-    for _, _, item in flat:
+    for _, _, _, item in flat:
         token = hashlib.md5(f"{item.image_url}|{item.bg_url}".encode()).hexdigest()[:12]
         bg_paths.append(paths.TEMP_DIR / f"card_bg_{token}.png")
         goods_paths.append(paths.TEMP_DIR / f"card_goods_{token}.png")
 
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for (_, _, item), bg_path, goods_path in zip(flat, bg_paths, goods_paths):
+        for (_, _, _, item), bg_path, goods_path in zip(flat, bg_paths, goods_paths):
             if not bg_path.exists():
                 tasks.append(_download(session, item.bg_url, bg_path))
             if not goods_path.exists():
@@ -256,31 +285,44 @@ async def render_sections(
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # 先按区块生成卡片行
-    card_lookup: dict[tuple[int, int], Image.Image] = {}
-    for (section, index, item), bg_path, goods_path in zip(flat, bg_paths, goods_paths):
-        card_lookup[(id(section), index)] = _render_card(item, index, bg_path, goods_path)
+    card_lookup: dict[tuple[int, int, int], Image.Image] = {}
+    for (entry_index, section, index, item), bg_path, goods_path in zip(
+        flat, bg_paths, goods_paths
+    ):
+        card_lookup[(entry_index, id(section), index)] = _render_card(
+            item, index, bg_path, goods_path
+        )
 
     heights = [TITLE_H + PADDING]
-    for section in sections:
-        rows = (len(section.items) + 1) // 2
-        heights.append(SECTION_H + 4 + rows * CARD_H + (rows - 1) * GAP + GAP)
+    for name, _, sections in entries:
+        if name:
+            heights.append(ACCOUNT_H)
+        for section in sections:
+            rows = (len(section.items) + 1) // 2
+            heights.append(SECTION_H + 4 + rows * CARD_H + (rows - 1) * GAP + GAP)
     total_height = int(sum(heights) + FOOTER_H + PADDING)
     canvas = Image.new("RGBA", (WIDTH, total_height), BACKGROUND + (255,))
-    canvas.alpha_composite(_render_title(len(flat), date_text), (0, PADDING))
+    canvas.alpha_composite(_render_title(len(flat), date_text, len(entries)), (0, PADDING))
 
     y = PADDING + TITLE_H
-    for section in sections:
-        canvas.alpha_composite(_render_section_header(section), (0, y))
-        y += SECTION_H + 4
-        for row_start in range(0, len(section.items), 2):
-            for column in range(2):
-                index = row_start + column
-                if index >= len(section.items):
-                    continue
-                card = card_lookup[(id(section), index)]
-                x = PADDING + column * (CARD_W + GAP)
-                canvas.alpha_composite(card, (x, y))
-            y += CARD_H + GAP
+    first_account = True
+    for entry_index, (name, meta, sections) in enumerate(entries):
+        if name:
+            canvas.alpha_composite(_render_account_header(name, meta, first_account), (0, y))
+            first_account = False
+            y += ACCOUNT_H
+        for section in sections:
+            canvas.alpha_composite(_render_section_header(section), (0, y))
+            y += SECTION_H + 4
+            for row_start in range(0, len(section.items), 2):
+                for column in range(2):
+                    index = row_start + column
+                    if index >= len(section.items):
+                        continue
+                    card = card_lookup[(entry_index, id(section), index)]
+                    x = PADDING + column * (CARD_W + GAP)
+                    canvas.alpha_composite(card, (x, y))
+                y += CARD_H + GAP
 
     draw = ImageDraw.Draw(canvas)
     draw.text(
@@ -294,3 +336,12 @@ async def render_sections(
     canvas.convert("RGB").save(out_path, quality=88, optimize=True)
     logger.info("商店图片已生成：%s", out_path)
     return out_path
+
+
+async def render_sections(
+    sections: list[ShopSection],
+    date_text: str | None = None,
+    out_dir: Path | None = None,
+) -> Path:
+    """单账号渲染入口，保留给旧调用方。"""
+    return await render_accounts([("", "", sections)], date_text, out_dir)

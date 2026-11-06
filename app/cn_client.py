@@ -8,9 +8,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
-from . import config, paths
+from . import paths
 from .models import SECTION_TITLES, ShopItem, ShopSection
 
 logger = logging.getLogger(__name__)
@@ -41,14 +41,6 @@ class AuthExpiredError(RuntimeError):
 
 def new_app():
     return ref().ValorantShopEmail()
-
-
-def load_credentials() -> Optional[dict[str, Any]]:
-    return new_app().load_config()
-
-
-def save_credentials(data: dict[str, Any]) -> None:
-    new_app().save_config(data)
 
 
 async def fetch_response(
@@ -103,7 +95,3 @@ def parse_sections(response: dict[str, Any], keys: list[str]) -> list[ShopSectio
             )
         )
     return parsed
-
-
-def is_logged_in() -> bool:
-    return config.has_credentials()

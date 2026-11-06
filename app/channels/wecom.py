@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,62 @@ _HINTS = {
 def is_configured(settings: dict[str, Any]) -> bool:
     wecom = settings["wecom"]
     return bool(wecom["corpid"] and wecom["agentid"] and wecom["secret"])
+
+
+# 查询本机出口 IP 的公共服务，并发请求，谁先返回用谁
+_IP_ENDPOINTS = (
+    "https://myip.ipip.net",
+    "https://ipv4.icanhazip.com",
+    "https://ifconfig.me/ip",
+    "https://api.ipify.org",
+)
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def mask_ip(ip: str) -> str:
+    """页面展示用的打码 IP：只保留前两段。"""
+    parts = ip.strip().split(".")
+    if len(parts) == 4:
+        return f"{parts[0]}.{parts[1]}.***.***"
+    return "***"
+
+
+async def _fetch_ip(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url) as response:
+        if response.status != 200:
+            return ""
+        text = await response.text()
+    match = _IPV4_RE.search(text)
+    return match.group(0) if match else ""
+
+
+async def detect_public_ip() -> str:
+    """检测本机出口公网 IP（用于填写企业微信「企业可信 IP」），失败返回空串。
+
+    并发访问多个公共服务：部分地区访问个别站点很慢，串行等待会直接超时。
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers={"User-Agent": "ValorantPushPersonal"}
+        ) as session:
+            tasks = {asyncio.create_task(_fetch_ip(session, url)) for url in _IP_ENDPOINTS}
+            try:
+                while tasks:
+                    done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if task.cancelled() or task.exception():
+                            continue
+                        ip = task.result()
+                        if ip:
+                            return ip
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as exc:  # 检测失败不能影响设置页其它功能
+        logger.warning("检测出口 IP 失败：%s", exc)
+    return ""
 
 
 def _error(payload: dict[str, Any], api: str) -> ChannelError:

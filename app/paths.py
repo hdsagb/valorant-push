@@ -37,7 +37,9 @@ TEMP_DIR = DATA_DIR / "temp"
 OUT_DIR = DATA_DIR / "out"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 STATE_FILE = DATA_DIR / "state.json"
-# 登录凭证由 vendored 脚本写入同一个 config.json
+# 多账号凭证（app/accounts.py 维护）
+ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+# 旧版单账号凭证，仅用于首次启动时迁移
 CREDENTIALS_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "app.log"
 

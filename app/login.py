@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import cn_client, config, paths
+from . import accounts, cn_client, config, paths
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class LoginSession:
         self.message = "正在生成二维码…"
         self.qr_path: Path | None = None
         self.task: asyncio.Task | None = None
+        self.account: dict[str, Any] | None = None
 
     async def start(self) -> None:
         app = cn_client.new_app()
@@ -68,7 +69,7 @@ class LoginSession:
             if not final_config:
                 self.state, self.message = "failed", "扫码成功，但换取登录凭证失败，请重试"
                 return
-            self._finish(app, final_config)
+            self._finish(final_config)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -88,23 +89,36 @@ class LoginSession:
             if not final_config:
                 self.state, self.message = "timeout", "二维码已过期，请重新生成"
                 return
-            self._finish(app, final_config)
+            self._finish(final_config)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("微信登录失败")
             self.state, self.message = "failed", f"微信登录失败：{exc}"
 
-    def _finish(self, app: Any, final_config: dict[str, Any]) -> None:
+    def _finish(self, final_config: dict[str, Any]) -> None:
         if not final_config.get("userId") or not final_config.get("tid"):
             self.state, self.message = "failed", "登录失败：未获取到账号凭证"
             return
-        app.save_config(final_config)
+        try:
+            account, updated = accounts.add(final_config, self.method)
+        except accounts.AccountLimitError as exc:
+            self.state, self.message = "failed", str(exc)
+            return
+
         settings = config.load_settings()
         config.save_settings({**settings, "login_method": self.method})
         config.update_state(auth_expired=False, last_error="")
-        self.state, self.message = "success", "登录成功"
-        logger.info("扫码登录成功，凭证已保存")
+        self.account = {
+            "id": account["id"],
+            "name": account["name"],
+            "updated": updated,
+        }
+        if updated:
+            self.state, self.message = "success", f"已更新「{account['name']}」的登录凭证"
+        else:
+            self.state, self.message = "success", f"登录成功，已绑定「{account['name']}」"
+        logger.info("扫码登录成功，已写入账号库：%s", account["name"])
 
     def cancel(self) -> None:
         if self.task and not self.task.done():
@@ -116,6 +130,7 @@ class LoginSession:
             "state": self.state,
             "message": self.message,
             "has_qr": bool(self.qr_path and self.qr_path.exists()),
+            "account": self.account,
         }
 
 
