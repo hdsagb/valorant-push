@@ -89,6 +89,23 @@ logging.basicConfig(
 logger = logging.getLogger("valorant_shop_email")
 
 
+def _mask_email(address: str) -> str:
+    """日志脱敏：a***@qq.com"""
+    text = str(address or "").strip()
+    if "@" not in text:
+        return "***" if text else ""
+    local, domain = text.split("@", 1)
+    return f"{local[:1]}***@{domain}"
+
+
+def _mask_user_id(user_id: Any) -> str:
+    """日志脱敏：只保留末 4 位。"""
+    text = str(user_id or "")
+    if not text:
+        return ""
+    return "***" if len(text) <= 4 else "***" + text[-4:]
+
+
 def infer_mail_provider(address: str) -> str:
     domain = (address.rsplit("@", 1)[-1] if "@" in address else "").lower()
     if domain == "163.com":
@@ -851,7 +868,7 @@ class ValorantShopEmail:
                     f"tid={wt};"
                 )
 
-                logger.info("[QQ登录] 登录成功 userId=%s", user_id)
+                logger.info("[QQ登录] 登录成功 userId=%s", _mask_user_id(user_id))
                 return {
                     "userId": user_id,
                     "tid": wt,
@@ -1068,7 +1085,7 @@ class ValorantShopEmail:
                 if login_info and login_info.get("result") == 0:
                     user_id = login_info.get("user_id")
                     wt = login_info.get("wt")
-                    logger.info("[微信登录] 登录成功 userId=%s", user_id)
+                    logger.info("[微信登录] 登录成功 userId=%s", _mask_user_id(user_id))
                     return {
                         "userId": user_id,
                         "tid": wt,
@@ -1436,7 +1453,7 @@ class ValorantShopEmail:
 
         msg["From"] = MAIL_USER
         msg["To"] = ", ".join(recipients)
-        logger.info("正在发送邮件到：%s", ", ".join(recipients))
+        logger.info("正在发送邮件到：%s", ", ".join(_mask_email(item) for item in recipients))
         if smtp_security == "ssl":
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as smtp:
                 smtp.login(SMTP_USERNAME, MAIL_PASS)

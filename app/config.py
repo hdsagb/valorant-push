@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from . import paths
+from . import paths, protect
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "email": {
         "smtp_host": "",
         "smtp_port": 465,
-        "security": "ssl",  # ssl | starttls | none
+        "security": "ssl",  # ssl | starttls（不再支持不加密连接）
         "username": "",
         "password": "",
         "to": "",
@@ -104,13 +104,32 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 # ---------- 设置 ----------
 
 
+def _decrypt_secrets(settings: dict[str, Any]) -> dict[str, Any]:
+    for section, field in SECRET_FIELDS:
+        target = settings.get(section)
+        if isinstance(target, dict) and isinstance(target.get(field), str):
+            target[field] = protect.decrypt_text(target[field])
+    return settings
+
+
+def _encrypt_secrets(settings: dict[str, Any]) -> dict[str, Any]:
+    data = copy.deepcopy(settings)
+    for section, field in SECRET_FIELDS:
+        target = data.get(section)
+        if isinstance(target, dict) and isinstance(target.get(field), str):
+            target[field] = protect.encrypt_text(target[field])
+    return data
+
+
 def load_settings() -> dict[str, Any]:
-    return _merge(DEFAULT_SETTINGS, _read_json(paths.SETTINGS_FILE, DEFAULT_SETTINGS))
+    return _decrypt_secrets(
+        _merge(DEFAULT_SETTINGS, _read_json(paths.SETTINGS_FILE, DEFAULT_SETTINGS))
+    )
 
 
 def save_settings(data: dict[str, Any]) -> dict[str, Any]:
     settings = normalize(_merge(DEFAULT_SETTINGS, data))
-    _write_json(paths.SETTINGS_FILE, settings)
+    _write_json(paths.SETTINGS_FILE, _encrypt_secrets(settings))
     logger.info("配置已保存：%s", paths.SETTINGS_FILE)
     return settings
 
@@ -145,8 +164,9 @@ def normalize(data: dict[str, Any]) -> dict[str, Any]:
         email["smtp_port"] = int(email.get("smtp_port") or 465)
     except (TypeError, ValueError):
         email["smtp_port"] = 465
-    if email.get("security") not in {"ssl", "starttls", "none"}:
-        email["security"] = "ssl"
+    if email.get("security") not in {"ssl", "starttls"}:
+        # 旧版本的 "none"（明文 25 端口）一律升级为 STARTTLS，避免凭证明文传输
+        email["security"] = "starttls" if email.get("security") == "none" else "ssl"
     for key in ("smtp_host", "username", "password", "to"):
         email[key] = str(email.get(key) or "").strip()
     email["from_name"] = str(email.get("from_name") or "无畏契约商店").strip()

@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -22,15 +24,45 @@ logger = logging.getLogger(__name__)
 HOSTS = ("127.0.0.1", "localhost", "::1")
 PORT_CANDIDATES = range(8787, 8808)
 
+# 每次启动随机生成，页面通过 <meta name="csrf-token"> 拿到；写接口必须带上它
+CSRF_TOKEN = secrets.token_urlsafe(32)
+CSRF_HEADER = "X-CSRF-Token"
+REQUESTED_WITH = "ValorantPushPersonal"
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
 routes = web.RouteTableDef()
+
+
+def _origin_allowed(origin: str) -> bool:
+    """允许省略 Origin（非浏览器请求），但带了就必须是本机页面。"""
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.hostname in HOSTS
 
 
 @web.middleware
 async def local_only(request: web.Request, handler):
-    """只接受本机访问，避免被局域网页面的请求命中。"""
+    """只接受本机页面发起的请求：校验 Host / Origin / Sec-Fetch-Site + 写接口令牌。"""
     host = (request.host or "").split(":")[0].strip("[]")
     if host not in HOSTS:
         return web.Response(status=403, text="local access only")
+    if not _origin_allowed(request.headers.get("Origin", "")):
+        return web.Response(status=403, text="cross-site request blocked")
+    fetch_site = request.headers.get("Sec-Fetch-Site", "")
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return web.Response(status=403, text="cross-site request blocked")
+    if request.method not in SAFE_METHODS:
+        token = request.headers.get(CSRF_HEADER, "")
+        if (
+            request.headers.get("X-Requested-With") != REQUESTED_WITH
+            or not token
+            or not secrets.compare_digest(token, CSRF_TOKEN)
+        ):
+            return web.Response(status=403, text="invalid request token")
     return await handler(request)
 
 
@@ -94,7 +126,13 @@ def _autostart_state() -> bool:
 
 @routes.get("/")
 async def index(_: web.Request) -> web.Response:
-    return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
+    html = INDEX_HTML.replace("__CSRF_TOKEN__", CSRF_TOKEN)
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @routes.get("/api/status")
@@ -172,6 +210,20 @@ async def api_test_channel(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "message": "；".join(problems)}, status=400
         )
+
+    if channel == "email":
+        # 防止页面被构造后把邮件凭据发到任意主机：只允许已保存的服务器或常见邮箱服务商
+        host = settings["email"]["smtp_host"].strip().lower()
+        saved_host = config.load_settings()["email"]["smtp_host"].strip().lower()
+        known_hosts = {item[0] for item in config.SMTP_GUESS.values()}
+        if host != saved_host and host not in known_hosts:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "message": "测试只支持常见邮箱服务商或已保存的 SMTP 服务器；自定义服务器请先保存设置再测试",
+                },
+                status=400,
+            )
 
     try:
         if channel == "wecom":
@@ -322,6 +374,7 @@ INDEX_HTML = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
 <title>无畏契约商店推送 · 设置</title>
 <style>
   :root{
@@ -533,12 +586,12 @@ INDEX_HTML = r'''<!doctype html>
             <select id="e_security">
               <option value="ssl">SSL（465）</option>
               <option value="starttls">STARTTLS（587）</option>
-              <option value="none">不加密（25）</option>
             </select>
           </label>
         </div>
         <label class="field"><span>发件人显示名</span><input id="e_name" placeholder="无畏契约商店"></label>
         <p class="hint">QQ / 163 邮箱需要在网页版设置里开启 SMTP 并生成「授权码」，不是登录密码。</p>
+        <p class="hint">出于安全考虑，程序不提供「不加密 SMTP」；服务器不支持 SSL / STARTTLS 时不会发送，避免授权码明文上网。</p>
       </div>
 
       <div id="wecomPane" class="hidden">
@@ -552,10 +605,11 @@ INDEX_HTML = r'''<!doctype html>
           <span class="ip-label">本机出口 IP</span>
           <code id="publicIp">未检测</code>
           <button class="action" id="ipCopy" disabled>复制</button>
-          <button class="action" id="ipRefresh">重新检测</button>
+          <button class="action" id="ipRefresh">检测 IP</button>
           <span class="inline-msg" id="ipMsg"></span>
         </div>
         <p class="hint">点「复制」得到完整 IP，粘贴到企业微信后台「应用管理 → 自建应用 → 企业可信 IP」。页面上只做打码显示，完整地址只写入剪贴板。</p>
+        <p class="hint warn">点击「检测 IP」时，程序会依次请求 myip.ipip.net、icanhazip.com、ifconfig.me、api.ipify.org 获取你的公网 IP；除此之外不会向任何第三方发送数据。如不希望使用，可自行在百度搜索「IP」查看后手填。</p>
         <p class="hint warn">自建应用要求把本机出口 IP 加入「企业可信 IP」。家用宽带 IP 变化时会返回 60020，程序会自动改用邮件（需同时配置邮件）。</p>
       </div>
 
@@ -669,8 +723,16 @@ function toast(message, kind) {
   el._timer = setTimeout(() => { el.className = 'toast ' + (kind || ''); }, 4200);
 }
 
+// 本地接口只接受本站页面发起的请求：带上自定义头 + 每次启动随机生成的令牌
+const CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+
 async function api(path, options) {
-  const opts = Object.assign({ headers: { 'Content-Type': 'application/json' } }, options || {});
+  const opts = Object.assign({}, options || {});
+  opts.headers = Object.assign({
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'ValorantPushPersonal',
+    'X-CSRF-Token': CSRF_TOKEN
+  }, (options && options.headers) || {});
   const res = await fetch(path, opts);
   let data = {};
   try { data = await res.json(); } catch (e) {}
@@ -720,8 +782,6 @@ function fillSettings(s) {
   $('w_secret').value = '';
   $('w_secret').placeholder = s.wecom.secret_set ? '已保存，留空保持不变' : '应用 Secret';
   $('w_touser').value = s.wecom.touser || '@all';
-
-  if (state.channel === 'wecom') detectPublicIp(false);
 
   const hh = String(s.push_hour).padStart(2, '0');
   const mm = String(s.push_minute).padStart(2, '0');
@@ -958,12 +1018,10 @@ function switchChannel(channel) {
   });
   $('emailPane').classList.toggle('hidden', channel !== 'email');
   $('wecomPane').classList.toggle('hidden', channel !== 'wecom');
-  if (channel === 'wecom') detectPublicIp(false);
 }
 
-// 检测本机出口 IP：页面只显示打码结果，完整地址留在内存里供「复制」使用
-async function detectPublicIp(force) {
-  if (state.publicIp && !force) return;
+// 检测本机出口 IP：仅由「检测 IP」按钮显式触发，页面只显示打码结果
+async function detectPublicIp() {
   $('publicIp').textContent = '检测中…';
   $('ipCopy').disabled = true;
   setMsg('ipMsg', '');
@@ -1010,9 +1068,8 @@ async function testChannel() {
     const data = err.data || {};
     setMsg('testMsg', err.message, 'err');
     if (data.code === 60020) {
-      detectPublicIp(true);
       switchChannel('email');
-      toast('企业微信返回 60020（可信 IP 不匹配），已切换到邮件渠道。\n请填写邮件配置后保存。', 'err');
+      toast('企业微信返回 60020（可信 IP 不匹配），已切换到邮件渠道。\n如仍想用企业微信，请点「检测 IP」后更新后台白名单，并填写邮件配置后保存。', 'err');
       return;
     }
     toast(err.message, 'err');
@@ -1142,7 +1199,7 @@ $('nameModal').addEventListener('click', (e) => {
   if (e.target === $('nameModal')) closeNameModal();
 });
 $('testBtn').addEventListener('click', testChannel);
-$('ipRefresh').addEventListener('click', () => detectPublicIp(true));
+$('ipRefresh').addEventListener('click', () => detectPublicIp());
 $('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
 $('pushBtn').addEventListener('click', pushNow);

@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 APP_NAME = "无畏契约商店推送"
 VERSION = "1.0.0"
@@ -47,6 +50,30 @@ LOG_FILE = DATA_DIR / "app.log"
 def ensure_dirs() -> None:
     for path in (DATA_DIR, TEMP_DIR, OUT_DIR):
         path.mkdir(parents=True, exist_ok=True)
+    _harden_acl(DATA_DIR)
+
+
+_acl_hardened: set[str] = set()
+
+
+def _harden_acl(directory: Path) -> None:
+    """把数据目录权限收紧到仅当前 Windows 用户（去掉继承的其他用户/Everyone）。"""
+    key = str(directory)
+    if os.name != "nt" or key in _acl_hardened:
+        return
+    _acl_hardened.add(key)
+    user = os.getenv("USERNAME")
+    if not user:
+        return
+    try:
+        subprocess.run(
+            ["icacls", key, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F", "/C", "/Q"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("收紧数据目录权限失败（不影响使用）：%s", exc)
 
 
 def setup_logging(debug: bool = False) -> None:

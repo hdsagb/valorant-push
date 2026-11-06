@@ -39,6 +39,19 @@ SOFTWARE.
 | 依赖 | 许可证 | 项目地址 |
 | --- | --- | --- |
 | aiohttp | Apache-2.0 | https://github.com/aio-libs/aiohttp |
-| Pillow | MIT-CMU | https://github.com/python-pillow/Pillow |
+| Pillow | MIT-CMU（HPND） | https://github.com/python-pillow/Pillow |
 | pystray | LGPL-3.0 | https://github.com/moses-palmer/pystray |
 | tzdata | Apache-2.0 | https://github.com/python/tzdata |
+
+## LGPL-3.0 合规说明（pystray）
+
+发布包通过 PyInstaller 打包，pystray 以库形式被链接进 `ValorantPushPersonal.exe`。按 LGPL-3.0 的要求：
+
+- 许可证全文：https://www.gnu.org/licenses/lgpl-3.0.txt
+- 对应源码：https://github.com/moses-palmer/pystray （本项目使用 0.19.5 版本，tag `v0.19.5`）
+- 重新链接方式：pystray 为纯 Python 包，可将其源码放入 `site-packages/pystray` 后，按 [README](README.md) 中的打包步骤重新执行 `pyinstaller ValorantPushPersonal.spec`，即可生成使用修改版 pystray 的程序。本项目未对 pystray 做任何修改。
+
+## Apache-2.0 声明（aiohttp / tzdata）
+
+分发本程序时随附本文件与 [LICENSE](LICENSE)，即满足 Apache-2.0 第 4 条对许可证与声明保留的要求。aiohttp、tzdata 的完整许可证文本可在上表项目地址的 `LICENSE` / `LICENSE.txt` 中获取。
+

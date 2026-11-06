@@ -86,6 +86,5 @@ def run_tray(runtime: Runtime) -> None:
     )
 
     icon = pystray.Icon("valorant-shop-push", _icon_image(), "无畏契约商店推送", menu)
-    icon_ref["icon"] = icon
     logger.info("托盘已启动，设置面板：%s", runtime.url)
     icon.run()

@@ -16,6 +16,7 @@ from email.utils import formataddr, formatdate
 from pathlib import Path
 from typing import Any
 
+from .. import protect
 from .base import ChannelError, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -69,10 +70,17 @@ def _send_sync(settings: dict[str, Any], msg: OutgoingMessage) -> None:
         if security == "ssl":
             client: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=30, context=context)
         else:
+            # 已不再支持明文 SMTP：必须 STARTTLS，否则拒绝发送，避免授权码明文上网
             client = smtplib.SMTP(host, port, timeout=30)
         with client:
             client.ehlo()
-            if security == "starttls":
+            if security != "ssl":
+                if not client.has_extn("starttls"):
+                    raise ChannelError(
+                        "email",
+                        "该 SMTP 服务器不支持 STARTTLS 加密，已中止发送以避免授权码明文传输。"
+                        "请改用 SSL（通常 465 端口）或更换邮箱服务商。",
+                    )
                 client.starttls(context=context)
                 client.ehlo()
             if email["username"]:
@@ -89,7 +97,10 @@ def _send_sync(settings: dict[str, Any], msg: OutgoingMessage) -> None:
 
 
 async def send(settings: dict[str, Any], msg: OutgoingMessage) -> None:
-    logger.info("通过邮件发送：%s -> %s", settings["email"]["username"], _recipients(settings["email"]))
+    # 日志只记录脱敏后的邮箱，避免 app.log 泄露个人信息
+    sender = protect.mask_email(settings["email"]["username"])
+    targets = ", ".join(protect.mask_email(item) for item in _recipients(settings["email"]))
+    logger.info("通过邮件发送：%s -> %s", sender, targets)
     await asyncio.to_thread(_send_sync, settings, msg)
     logger.info("邮件已发送")
 

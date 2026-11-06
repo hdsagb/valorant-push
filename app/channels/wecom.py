@@ -16,7 +16,7 @@ from typing import Any
 
 import aiohttp
 
-from .. import paths
+from .. import paths, protect
 from .base import ChannelError, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,7 @@ def _read_cached_token(wecom: dict[str, Any]) -> str | None:
     if cached.get("key") != _cache_key(wecom):
         return None
     if cached.get("expires_at", 0) > time.time() + 120:
-        return str(cached.get("access_token") or "") or None
+        return protect.decrypt_text(str(cached.get("access_token") or "")) or None
     return None
 
 
@@ -146,7 +146,7 @@ async def get_access_token(
             json.dumps(
                 {
                     "key": _cache_key(wecom),
-                    "access_token": token,
+                    "access_token": protect.encrypt_text(token),
                     "expires_at": time.time() + expires_in - 300,
                 }
             ),

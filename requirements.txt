@@ -1,4 +1,5 @@
-aiohttp>=3.9,<4
-Pillow>=10.0
-pystray>=0.19.5
-tzdata>=2024.1; sys_platform == "win32"
+# 运行时依赖：全部锁定到确定版本，避免上游更新引入非预期变更
+aiohttp==3.14.5
+Pillow==12.3.0
+pystray==0.19.5
+tzdata==2025.3; sys_platform == "win32"

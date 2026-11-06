@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from . import paths
+from . import paths, protect
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,11 @@ def _read_store() -> dict[str, Any]:
     try:
         data = json.loads(paths.ACCOUNTS_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("accounts"), list):
+            for account in data["accounts"]:
+                if isinstance(account.get("credentials"), dict):
+                    account["credentials"] = protect.decrypt_fields(account["credentials"])
+                if isinstance(account.get("user_id"), str):
+                    account["user_id"] = protect.decrypt_text(account["user_id"])
             return data
     except (OSError, ValueError) as exc:
         logger.error("读取账号文件失败：%s", exc)
@@ -43,8 +48,15 @@ def _read_store() -> dict[str, Any]:
 
 def _write_store(data: dict[str, Any]) -> None:
     paths.ensure_dirs()
+    # 凭证与账号 ID 落盘前用 DPAPI 加密，避免明文保存在 data/accounts.json
+    payload = copy.deepcopy(data)
+    for account in payload.get("accounts", []):
+        if isinstance(account.get("credentials"), dict):
+            account["credentials"] = protect.encrypt_fields(account["credentials"])
+        if isinstance(account.get("user_id"), str):
+            account["user_id"] = protect.encrypt_text(account["user_id"])
     tmp = paths.ACCOUNTS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, paths.ACCOUNTS_FILE)
 
 
@@ -61,6 +73,9 @@ def _migrate_legacy() -> None:
         except (OSError, ValueError) as exc:
             logger.warning("旧版登录凭证读取失败，跳过迁移：%s", exc)
             data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data = protect.decrypt_fields(data)
         if data.get("userId") and data.get("tid"):
             accounts.append(_new_account(data, "账号1", str(data.get("login_type") or "qq")))
             logger.info("已把旧版单账号凭证迁移为「账号1」")
