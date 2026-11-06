@@ -246,6 +246,29 @@ def _render_section_header(section: ShopSection) -> Image.Image:
     return header
 
 
+def _remove_stale_cache(keep: set[Path]) -> None:
+    """删掉不属于本次渲染的商品图缓存，避免 data/temp 堆积历史图片。"""
+    for pattern in ("card_bg_*.png", "card_goods_*.png"):
+        for path in paths.TEMP_DIR.glob(pattern):
+            if path in keep:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _remove_old_outputs(out_dir: Path, keep: Path) -> None:
+    """新商店图生成后删掉旧的 out/shop_*.jpg，只保留最新一张。"""
+    for path in out_dir.glob("shop_*.jpg"):
+        if path == keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 async def render_accounts(
     entries: list[tuple[str, str, list[ShopSection]]],
     date_text: str | None = None,
@@ -273,6 +296,8 @@ async def render_accounts(
         token = hashlib.md5(f"{item.image_url}|{item.bg_url}".encode()).hexdigest()[:12]
         bg_paths.append(paths.TEMP_DIR / f"card_bg_{token}.png")
         goods_paths.append(paths.TEMP_DIR / f"card_goods_{token}.png")
+
+    _remove_stale_cache(set(bg_paths) | set(goods_paths))
 
     async with aiohttp.ClientSession() as session:
         tasks = []
@@ -334,6 +359,7 @@ async def render_accounts(
 
     out_path = out_dir / f"shop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
     canvas.convert("RGB").save(out_path, quality=88, optimize=True)
+    _remove_old_outputs(out_dir, out_path)
     logger.info("商店图片已生成：%s", out_path)
     return out_path
 

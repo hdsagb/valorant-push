@@ -193,6 +193,14 @@ class ValorantShopEmail:
             except OSError:
                 pass
 
+    def _remove_old_qr_files(self) -> None:
+        """重新生成二维码前清掉历史二维码，避免临时目录堆积。"""
+        for path in TEMP_DIR.glob("*_login_*.png"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     # ---------- 基础工具 ----------
 
     def _normalize_url(self, value: str, default: str = "") -> str:
@@ -625,6 +633,7 @@ class ValorantShopEmail:
                 raise RuntimeError("未获取到 qrsig")
 
             qr_path = TEMP_DIR / f"qq_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            self._remove_old_qr_files()
             qr_path.write_bytes(qr_image_bytes)
 
             logger.info("[QQ登录] 二维码已生成：%s", qr_path)
@@ -968,6 +977,7 @@ class ValorantShopEmail:
                 qr_image_bytes = base64.b64decode(qrcode_base64)
 
                 qr_path = TEMP_DIR / f"wechat_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                self._remove_old_qr_files()
                 qr_path.write_bytes(qr_image_bytes)
 
             return {"uuid": uuid, "qr_path": str(qr_path)}
