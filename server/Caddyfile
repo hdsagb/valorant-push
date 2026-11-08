@@ -1,0 +1,3 @@
+{$DOMAIN} {
+	reverse_proxy push_server:8787
+}

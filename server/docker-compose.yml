@@ -1,0 +1,38 @@
+# 服务器版一键部署。用法：server/README.md
+name: valorant-push
+
+services:
+  push_server:
+    image: ghcr.io/hdsagb/valorant-push-server:${IMAGE_TAG:-latest}   # 路径一：GHCR 镜像（主路径；tag 可经 .env 固定版本，R8-9）
+    build: .                                             # 路径二：源码构建（up -d --build，R7）；本文件在 server/ 内，context 即 server/
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      # 主密钥二选一：不设则自动生成 /data/master.key（务必按 README 备份）；
+      # 如固定密钥，把下行注释去掉并在 .env 里填 VAL_SERVER_MASTER_KEY
+      # - VAL_SERVER_MASTER_KEY=${VAL_SERVER_MASTER_KEY}
+    volumes:
+      - push_data:/data
+    # 过渡直连（无域名时，README 章节 4）：取消注释后 `docker compose up -d push_server`
+    # ports:
+    #   - "8787:8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - push_server
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:?请先复制 .env.example 为 .env 并设置 DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  push_data:
+  caddy_data:
+  caddy_config:
