@@ -8,7 +8,9 @@ ENV TZ=Asia/Shanghai \
 
 # tzdata：slim 无系统时区库，models.zone() 的 ZoneInfo 需要（M4 计划 §0 决策 6）
 # fonts-noto-cjk：渲染中文字体，Debian 安装路径即 render.py 候选路径（§0 决策 7）
-RUN apt-get update \
+# apt 换国内源：国内部署机源码构建（R7 备选路径）加速；CI（GitHub Actions）访问阿里云源亦可达
+RUN sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends tzdata fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \
     && ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
@@ -19,7 +21,8 @@ RUN useradd --uid 1000 --create-home app \
 
 WORKDIR /srv
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# pip 换清华源：同上，加速国内源码构建
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 COPY push_server/ ./push_server/
 
 USER app
