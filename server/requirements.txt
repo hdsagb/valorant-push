@@ -1,0 +1,5 @@
+# 服务器版运行时依赖（与个人版独立维护，锁定确定版本）
+aiohttp==3.14.5
+Pillow==12.3.0
+cryptography==44.0.1
+tzdata==2025.3; sys_platform == "win32"
