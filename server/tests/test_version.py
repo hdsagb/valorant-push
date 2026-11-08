@@ -2,5 +2,5 @@
 import push_server
 
 
-def test_version_is_0_3_0():
-    assert push_server.__version__ == "0.3.0"
+def test_version_is_0_4_0():
+    assert push_server.__version__ == "0.4.0"
