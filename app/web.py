@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import secrets
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import __version__, accounts, config, login, paths, pipeline, scheduler
+from . import __version__, accounts, config, credpack, login, paths, pipeline, scheduler
 from .channels import ChannelError
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -175,6 +176,36 @@ async def api_accounts_remove(request: web.Request) -> web.Response:
         config.update_state(auth_expired=False)
     return web.json_response(
         {"ok": True, "message": "已解绑该账号", "count": remaining}
+    )
+
+
+@routes.post("/api/credentials/export")
+async def api_credentials_export(request: web.Request) -> web.Response:
+    body = await request.json()
+    try:
+        password = credpack.validate_password(str(body.get("password") or ""))
+    except credpack.CredpackError as exc:
+        return web.json_response({"ok": False, "message": str(exc)}, status=400)
+
+    rows = accounts.all()
+    payload = credpack.payload_accounts(rows)
+    if not payload:
+        return web.json_response(
+            {"ok": False, "message": "没有可导出的账号，请先扫码登录绑定账号"}, status=409
+        )
+    skipped = len(rows) - len(payload)
+    if skipped:
+        logger.info("导出凭证包：跳过 %s 个凭证残缺的账号", skipped)
+    content = credpack.build_pack(payload, password)
+    filename = credpack.pack_filename()
+    # 口令与凭证内容绝不落日志；日志只写文件名与账号数量
+    logger.info("已生成凭证包 %s（%s 个账号）", filename, len(payload))
+    return web.json_response(
+        {
+            "ok": True,
+            "filename": filename,
+            "content_b64": base64.b64encode(content).decode("ascii"),
+        }
     )
 
 
@@ -564,6 +595,10 @@ INDEX_HTML = r'''<!doctype html>
       <h2>2 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
       <p class="hint">最多可绑定 10 个账号。推送时会合并成一条消息，并按账号名分区，方便区分。</p>
       <div class="acc-list" id="accList"><div class="acc-empty">还没有绑定账号</div></div>
+      <div class="row" style="margin-top:12px">
+        <button class="action" id="exportBtn" disabled>导出凭证包</button>
+      </div>
+      <p class="hint">部署服务器版后，用「导出凭证包」把账号迁移过去；导入完成后请删除导出文件。</p>
     </section>
 
     <section class="card">
@@ -662,6 +697,21 @@ INDEX_HTML = r'''<!doctype html>
       <button class="action" id="nameCancel">取消</button>
       <button class="action primary" id="nameOk">保存</button>
     </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="exportModal">
+  <div class="modal-box">
+    <h3>导出凭证包</h3>
+    <p class="hint">把已绑定账号的登录凭证打包成加密文件，用于在服务器版导入。邮箱授权码、企业微信 Secret 不在包内，需在服务器版重新填写。</p>
+    <label class="field"><span>设置口令（至少 8 位）</span><input id="exportPass" type="password" placeholder="导入服务器版时需要同一个口令"></label>
+    <label class="field"><span>再次输入口令</span><input id="exportPass2" type="password"></label>
+    <p class="hint">凭证包含游戏登录凭证：导入完成后请删除该文件；请记住口令，忘记口令只能重新导出。</p>
+    <div class="row" style="justify-content:flex-end;margin-top:16px">
+      <button class="action" id="exportCancel">取消</button>
+      <button class="action primary" id="exportOk">生成并下载</button>
+    </div>
+    <span class="inline-msg" id="exportMsg"></span>
   </div>
 </div>
 
@@ -878,6 +928,7 @@ function renderStatus(s) {
 }
 
 function renderAccounts(list) {
+  $('exportBtn').disabled = list.length === 0;
   const box = $('accList');
   box.innerHTML = '';
   if (!list || !list.length) {
@@ -990,6 +1041,34 @@ async function loadAll() {
   } catch (err) {
     toast('加载失败：' + err.message, 'err');
   }
+}
+
+function openExportModal() {
+  $('exportPass').value = ''; $('exportPass2').value = '';
+  setMsg('exportMsg', '', 'info');
+  $('exportModal').classList.remove('hidden');
+  $('exportPass').focus();
+}
+function closeExportModal() { $('exportModal').classList.add('hidden'); }
+async function commitExport() {
+  const pw = $('exportPass').value, pw2 = $('exportPass2').value;
+  if (pw.length < 8) { setMsg('exportMsg', '口令至少 8 位', 'warn'); return; }
+  if (pw !== pw2) { setMsg('exportMsg', '两次输入的口令不一致', 'warn'); return; }
+  $('exportOk').disabled = true;
+  try {
+    const data = await api('/api/credentials/export', { method: 'POST', body: JSON.stringify({ password: pw }) });
+    const bin = atob(data.content_b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = data.filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    closeExportModal();
+    toast('已生成 ' + data.filename + '。这些账号导入服务器版后，请在个人版停止其定时推送；导入完成后请删除该文件。', 'ok');
+  } catch (e) { setMsg('exportMsg', e.message, 'err'); }
+  $('exportOk').disabled = false;
 }
 
 async function saveAll() {
@@ -1198,6 +1277,10 @@ $('nameInput').addEventListener('keydown', (e) => {
 $('nameModal').addEventListener('click', (e) => {
   if (e.target === $('nameModal')) closeNameModal();
 });
+$('exportBtn').addEventListener('click', openExportModal);
+$('exportCancel').addEventListener('click', closeExportModal);
+$('exportModal').addEventListener('click', (e) => { if (e.target === $('exportModal')) closeExportModal(); });
+$('exportOk').addEventListener('click', commitExport);
 $('testBtn').addEventListener('click', testChannel);
 $('ipRefresh').addEventListener('click', () => detectPublicIp());
 $('ipCopy').addEventListener('click', copyPublicIp);
