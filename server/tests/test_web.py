@@ -460,3 +460,26 @@ def test_import_requires_csrf(web_client_factory):
         headers=RW,  # 无 X-CSRF-Token
     )
     assert resp.status == 403
+
+
+def test_api_status_smoke_after_login(web_client_factory):
+    """集成冒烟：登录后（含导入账号后）/api/status 必须正常返回。
+
+    （M3 手工验收曾发现三处拷贝改造遗漏：config.wecom_configured 引用、
+    state 缺 last_channel/last_summary 兜底、summary 字段 masked_id
+    与个人版 user_id_masked 不一致——单测只覆盖空账号态，漏掉了登录态集成路径。）
+    """
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    content_b64 = base64.b64encode(make_pack(sample_payload(), PACK_PASSWORD)).decode()
+    resp = client.post(
+        "/api/credentials/import",
+        json={"content_b64": content_b64, "password": PACK_PASSWORD},
+        headers={**RW, "X-CSRF-Token": token},
+    )
+    assert resp.status == 200
+    resp = client.get("/api/status")
+    assert resp.status == 200
+    assert resp.data["account_count"] == 1
+    assert resp.data["user_id_masked"] == "***0001"  # 服务器版掩码字段（不落明文 user_id）

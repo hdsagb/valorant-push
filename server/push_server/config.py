@@ -208,6 +208,8 @@ def load_state() -> dict:
     state.setdefault("last_push_date", "")
     state.setdefault("last_push_ok", None)
     state.setdefault("last_push_at", "")
+    state.setdefault("last_channel", "")  # 首次推送前由 pipeline 写入，页面要兜底
+    state.setdefault("last_summary", "")
     state.setdefault("last_error", "")
     return state
 

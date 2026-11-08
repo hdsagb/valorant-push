@@ -146,7 +146,7 @@ def _masked_status() -> dict[str, Any]:
         "version": __version__,
         "logged_in": logged_in,
         "login_type": (single["login_type"] if single else ("multi" if account_count > 1 else "")),
-        "user_id_masked": single["user_id_masked"] if single else "",
+        "user_id_masked": single["masked_id"] if single else "",
         "accounts": account_list,
         "account_count": account_count,
         "account_limit": accounts.MAX_ACCOUNTS,
@@ -154,7 +154,7 @@ def _masked_status() -> dict[str, Any]:
         "auth_expired": auth_expired,
         "channel": settings["channel"],
         "email_configured": config.email_configured(settings),
-        "wecom_configured": config.wecom_configured(settings),
+        "wecom_configured": config.channel_configured(settings, "wecom"),
         "config_problems": config.validate(settings),
         "schedule_enabled": settings["schedule_enabled"],
         "push_time": f"{settings['push_hour']:02d}:{settings['push_minute']:02d}",
@@ -972,7 +972,7 @@ function renderAccounts(list) {
     }
     const meta = document.createElement('div');
     meta.className = 'acc-meta';
-    meta.textContent = (acc.login_type === 'wechat' ? '微信' : 'QQ') + ' · ' + acc.user_id_masked +
+    meta.textContent = (acc.login_type === 'wechat' ? '微信' : 'QQ') + ' · ' + acc.masked_id +
       (acc.added_at ? ' · 绑定于 ' + acc.added_at : '');
     main.appendChild(nameRow);
     main.appendChild(meta);
