@@ -58,7 +58,9 @@ class WebClient:
                 data = json.loads(text)
             except ValueError:
                 data = None
-            return SimpleNamespace(status=resp.status, text=text, data=data)
+            return SimpleNamespace(
+                status=resp.status, text=text, data=data, headers=resp.headers
+            )
 
         return self._loop.run_until_complete(_do())
 
@@ -102,3 +104,11 @@ def web_routes_client(web_client_factory) -> WebClient:
     app = aiohttp_web.Application()
     app.add_routes(web.routes)
     return web_client_factory(app)
+
+
+@pytest.fixture
+def web_app_client(web_client_factory) -> WebClient:
+    """完整 build_app（含 auth_guard 中间件）的 WebClient。"""
+    from push_server import web
+
+    return web_client_factory(web.build_app())

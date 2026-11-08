@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import secrets
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import __version__, accounts, config, paths, pipeline, scheduler
+from . import __version__, accounts, auth, config, paths, pipeline, scheduler
 from .channels import ChannelError
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -26,6 +28,96 @@ logger = logging.getLogger(__name__)
 CSRF_HEADER = "X-CSRF-Token"
 REQUESTED_WITH = "ValorantPushPersonal"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# 免鉴权路径（设计规格表）：健康检查、登录/设置页与进入会话的前置接口、favicon
+SAFE_PATHS = frozenset({"/healthz", "/login", "/setup", "/favicon.ico"})
+SAFE_API_PATHS = frozenset({"/api/login", "/api/setup"})
+
+_scheduler_task: asyncio.Task | None = None
+
+
+def set_scheduler_task(task: asyncio.Task | None) -> None:
+    """serve 模式注册调度任务，供 /healthz 汇报运行状态。"""
+    global _scheduler_task
+    _scheduler_task = task
+
+
+def _cookie_secure(request: web.Request) -> bool:
+    """Cookie Secure 自动探测：反代 HTTPS（X-Forwarded-Proto）或原生 https 时加 Secure；
+    环境变量 VAL_SERVER_COOKIE_SECURE=1/0 强制覆盖（M4 文档写入安全清单）。"""
+    override = os.getenv("VAL_SERVER_COOKIE_SECURE")
+    if override is not None:
+        return override == "1"
+    if request.url.scheme == "https":
+        return True
+    return (request.headers.get("X-Forwarded-Proto") or "").strip().lower() == "https"
+
+
+def _cross_site(request: web.Request) -> bool:
+    """同源校验（个人版三重校验的服务器版改造）：Origin 若存在必须与 Host 同主机名；
+    Sec-Fetch-Site 仅允许 same-origin/none；不再做 127.0.0.1 Host 白名单。"""
+    origin = request.headers.get("Origin", "")
+    if origin:
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return True
+        host = (request.host or "").split(":")[0].strip("[]")
+        if parsed.scheme not in {"http", "https"} or parsed.hostname != host:
+            return True
+    fetch_site = request.headers.get("Sec-Fetch-Site", "")
+    return bool(fetch_site) and fetch_site not in {"same-origin", "none"}
+
+
+@web.middleware
+async def auth_guard(request: web.Request, handler):
+    """取代个人版 local_only：会话鉴权 + 会话级 CSRF + 同源校验（M3 设计规格表）。
+
+    - 免鉴权：/healthz、/login、/setup、/favicon.ico；/api/login、/api/setup 只要求
+      X-Requested-With 头防跨站表单
+    - 未登录：页面 GET → 302 到 /setup（未初始化）或 /login；/api/* → 401 JSON
+    - 已登录写接口：校验 X-CSRF-Token（会话级）+ X-Requested-With
+    - 距签发超 24h 自动重签 cookie（滑动续期，token 不变）
+    """
+    path = request.path
+    if path == "/healthz":
+        return await handler(request)
+    if _cross_site(request):
+        return web.Response(status=403, text="cross-site request blocked")
+    if path in SAFE_API_PATHS:
+        if (
+            request.method not in SAFE_METHODS
+            and request.headers.get("X-Requested-With") != REQUESTED_WITH
+        ):
+            return web.json_response({"ok": False, "message": "非法请求"}, status=403)
+        return await handler(request)
+    if path in SAFE_PATHS:
+        return await handler(request)
+    token = request.cookies.get(auth.SESSION_COOKIE, "")
+    session = auth.get_session(token)
+    if session is None:
+        if path.startswith("/api/"):
+            return web.json_response({"ok": False, "code": "unauthorized"}, status=401)
+        raise web.HTTPFound("/setup" if not auth.is_initialized() else "/login")
+    if request.method not in SAFE_METHODS:
+        csrf = request.headers.get(CSRF_HEADER, "")
+        if (
+            request.headers.get("X-Requested-With") != REQUESTED_WITH
+            or not csrf
+            or not secrets.compare_digest(csrf, session["csrf"])
+        ):
+            return web.json_response({"ok": False, "message": "无效的请求令牌"}, status=403)
+    request["session"] = session
+    response = await handler(request)
+    if auth.should_reissue(session):
+        session["issued_at"] = time.time()
+        response.set_cookie(
+            auth.SESSION_COOKIE,
+            token,
+            **auth.session_cookie_kwargs(_cookie_secure(request)),
+        )
+    return response
+
 
 routes = web.RouteTableDef()
 
@@ -250,6 +342,83 @@ def build_app() -> web.Application:
     app.add_routes(routes)
     return app
 
+
+@routes.get("/healthz")
+async def healthz(_: web.Request) -> web.Response:
+    """健康检查（免鉴权）：仅版本号与调度状态。"""
+    running = _scheduler_task is not None and not _scheduler_task.done()
+    return web.json_response(
+        {
+            "ok": True,
+            "version": __version__,
+            "scheduler": "running" if running else "stopped",
+        }
+    )
+
+
+@routes.get("/setup")
+async def setup_page(_: web.Request) -> web.Response:
+    if auth.is_initialized():
+        raise web.HTTPFound("/login")
+    return web.Response(text=SETUP_HTML, content_type="text/html")
+
+
+@routes.get("/login")
+async def login_page(_: web.Request) -> web.Response:
+    if not auth.is_initialized():
+        raise web.HTTPFound("/setup")
+    return web.Response(text=LOGIN_HTML, content_type="text/html")
+
+
+@routes.post("/api/setup")
+async def api_setup(request: web.Request) -> web.Response:
+    if auth.is_initialized():
+        return web.json_response(
+            {"ok": False, "message": "访问密码已设置，请直接登录"}, status=409
+        )
+    body = await request.json()
+    try:
+        auth.set_password(str(body.get("password") or ""), str(body.get("setup_code") or ""))
+    except auth.AuthError as exc:
+        return web.json_response({"ok": False, "message": str(exc)}, status=400)
+    return _start_session(request)
+
+
+@routes.post("/api/login")
+async def api_login(request: web.Request) -> web.Response:
+    if not auth.is_initialized():
+        return web.json_response({"ok": False, "message": "请先完成初始化设置"}, status=409)
+    body = await request.json()
+    if auth.verify_password(str(body.get("password") or "")):
+        auth.reset_failures()  # 成功登录即清零（含锁定，§0 决策 6）
+        return _start_session(request)
+    auth.register_failure()  # 未锁：计数+1（达标即锁）；已锁：剩余时长翻倍
+    remaining = auth.lock_remaining()
+    if remaining > 0:
+        minutes = max(1, -(-int(remaining) // 60))
+        return web.json_response(
+            {"ok": False, "message": f"尝试次数过多，请 {minutes} 分钟后再试"}, status=429
+        )
+    await asyncio.sleep(auth.FAIL_DELAY)  # 固定延迟钝化时序探测
+    return web.json_response({"ok": False, "message": "口令错误"}, status=401)
+
+
+def _start_session(request: web.Request) -> web.Response:
+    token, _ = auth.create_session()
+    response = web.json_response({"ok": True, "redirect": "/"})
+    response.set_cookie(
+        auth.SESSION_COOKIE, token, **auth.session_cookie_kwargs(_cookie_secure(request))
+    )
+    return response
+
+
+@routes.post("/api/logout")
+async def api_logout(request: web.Request) -> web.Response:
+    auth.drop_session(request.cookies.get(auth.SESSION_COOKIE, ""))
+    response = web.json_response({"ok": True})
+    response.del_cookie(auth.SESSION_COOKIE, path="/")
+    return response
+
 INDEX_HTML = r'''<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -413,6 +582,7 @@ INDEX_HTML = r'''<!doctype html>
     </div>
     <div class="head-right">
       <span id="statusPill" class="pill">加载中…</span>
+      <button class="link" id="logoutBtn">退出登录</button>
     </div>
   </header>
 
@@ -431,10 +601,6 @@ INDEX_HTML = r'''<!doctype html>
       <h2>2 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
       <p class="hint">最多可绑定 10 个账号。推送时会合并成一条消息，并按账号名分区，方便区分。</p>
       <div class="acc-list" id="accList"><div class="acc-empty">还没有绑定账号</div></div>
-      <div class="row" style="margin-top:12px">
-        <button class="action" id="exportBtn" disabled>导出凭证包</button>
-      </div>
-      <p class="hint">部署服务器版后，用「导出凭证包」把账号迁移过去；导入完成后请删除导出文件。</p>
     </section>
 
     <section class="card">
@@ -600,6 +766,12 @@ async function api(path, options) {
   const res = await fetch(path, opts);
   let data = {};
   try { data = await res.json(); } catch (e) {}
+  if (res.status === 401) {
+    location.href = '/login';
+    const err = new Error('登录已失效，请重新登录');
+    err.data = data;
+    throw err;
+  }
   if (!res.ok) {
     const err = new Error(data.message || ('请求失败（' + res.status + '）'));
     err.data = data;
@@ -982,7 +1154,126 @@ $('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
 $('pushBtn').addEventListener('click', pushNow);
 
+$('logoutBtn').addEventListener('click', async () => {
+  try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (e) {}
+  location.href = '/login';
+});
+
 loadAll();
 </script>
 </body>
 </html>'''
+
+_AUTH_PAGE_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  background: #f5f6f8; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.box { background: #fff; border: 1px solid #e3e6ea; border-radius: 14px; padding: 32px 28px; width: 360px; }
+h1 { font-size: 18px; margin-bottom: 4px; }
+.sub { color: #8a919c; font-size: 13px; margin-bottom: 20px; }
+label { display: block; font-size: 13px; color: #5a6472; margin: 12px 0 6px; }
+input { width: 100%; padding: 10px 12px; border: 1px solid #d6dbe2; border-radius: 8px; font-size: 14px; }
+button { width: 100%; margin-top: 18px; padding: 10px; border: 0; border-radius: 8px;
+  background: #ff4655; color: #fff; font-size: 14px; cursor: pointer; }
+button:disabled { opacity: .6; cursor: not-allowed; }
+.msg { color: #c0392b; font-size: 13px; min-height: 18px; margin-top: 12px; }
+.hint { color: #8a919c; font-size: 12px; margin-top: 10px; line-height: 1.7; }
+"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 无畏契约商店推送（服务器版）</title>
+<style>
+""" + _AUTH_PAGE_CSS + """</style>
+</head>
+<body>
+<div class="box">
+  <h1>无畏契约商店推送</h1>
+  <p class="sub">服务器版管理界面</p>
+  <label for="password">访问口令</label>
+  <input id="password" type="password" autocomplete="current-password" autofocus>
+  <button id="go">登录</button>
+  <p class="msg" id="msg"></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+async function submit() {
+  $('msg').textContent = '';
+  $('go').disabled = true;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'ValorantPushPersonal' },
+      body: JSON.stringify({ password: $('password').value })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) { location.href = '/'; return; }
+    $('msg').textContent = data.message || '登录失败';
+  } catch (e) {
+    $('msg').textContent = '网络错误，请重试';
+  }
+  $('go').disabled = false;
+}
+$('go').addEventListener('click', submit);
+$('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+</script>
+</body>
+</html>
+"""
+
+SETUP_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>初始化 · 无畏契约商店推送（服务器版）</title>
+<style>
+""" + _AUTH_PAGE_CSS + """</style>
+</head>
+<body>
+<div class="box">
+  <h1>初始化管理界面</h1>
+  <p class="sub">首次访问：设置访问口令</p>
+  <label for="setupCode">一次性设置码（首次启动时打印在服务器日志）</label>
+  <input id="setupCode" autocomplete="off" placeholder="8 位十六进制">
+  <label for="password">访问口令（至少 8 位）</label>
+  <input id="password" type="password" autocomplete="new-password">
+  <label for="password2">再次输入口令</label>
+  <input id="password2" type="password" autocomplete="new-password">
+  <button id="go">完成设置</button>
+  <p class="msg" id="msg"></p>
+  <p class="hint">设置码只在首次启动时生成并打印到日志，设置成功后即失效；口令用于登录管理界面，请妥善保管。</p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+async function submit() {
+  $('msg').textContent = '';
+  const code = $('setupCode').value.trim();
+  const pw = $('password').value, pw2 = $('password2').value;
+  if (!code) { $('msg').textContent = '请输入设置码'; return; }
+  if (pw.length < 8) { $('msg').textContent = '口令至少 8 位'; return; }
+  if (pw !== pw2) { $('msg').textContent = '两次输入的口令不一致'; return; }
+  $('go').disabled = true;
+  try {
+    const res = await fetch('/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'ValorantPushPersonal' },
+      body: JSON.stringify({ setup_code: code, password: pw })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) { location.href = '/'; return; }
+    $('msg').textContent = data.message || '设置失败';
+  } catch (e) {
+    $('msg').textContent = '网络错误，请重试';
+  }
+  $('go').disabled = false;
+}
+$('go').addEventListener('click', submit);
+document.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+</script>
+</body>
+</html>
+"""

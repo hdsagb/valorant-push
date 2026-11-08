@@ -1,7 +1,7 @@
-"""web.py 基底裁剪测试：路由剥离与页面结构（Task 3）。
+"""web.py 测试：路由剥离 / 页面结构 / auth_guard / 登录设置 / 健康检查。
 
-测试直连 routes（无 auth_guard）——auth_guard 在 Task 4 接入后，
-未登录访问 `/` 由中间件重定向，本文件只关心「裁剪」与「页面结构」本身。
+路由剥离类用例直连 routes（无中间件，Task 3）；
+鉴权与页面类用例走 build_app（Task 4 起）。
 运行：python -m pytest server/tests/test_web.py -v
 """
 from __future__ import annotations
@@ -9,12 +9,48 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import time
 from pathlib import Path
 
-from push_server import web
+import pytest
+
+from push_server import __version__, auth, web
+
+PASSWORD = "口令-12345678"
+RW = {"X-Requested-With": "ValorantPushPersonal"}
 
 
-# ---------- 路由剥离（删掉的不能再出现） ----------
+@pytest.fixture(autouse=True)
+def _reset_auth_state(data_dir):
+    """依赖 data_dir：即使用例未显式请求，也强制隔离真实数据目录。"""
+    auth.reset_state()
+    yield
+    auth.reset_state()
+
+
+def _setup_password() -> None:
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+
+
+def _login(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.post("/api/login", json={"password": PASSWORD}, headers=RW)
+    assert resp.status == 200 and resp.data.get("ok")
+    return client
+
+
+def _csrf_of(client) -> str:
+    resp = client.get("/")
+    assert resp.status == 200
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', resp.text)
+    assert match, "主页必须注入会话级 csrf"
+    return match.group(1)
+
+
+# ============================================================
+# Task 3：路由剥离（删掉的不能再出现）
+# ============================================================
 
 def test_export_route_removed(web_routes_client):
     resp = web_routes_client.post(
@@ -38,17 +74,23 @@ def test_open_data_dir_removed(web_routes_client):
     assert web_routes_client.post("/api/open-data-dir", json={}).status == 404
 
 
-# ---------- 页面结构（保留项必须还在，删除项必须不在） ----------
+# ============================================================
+# Task 3：页面结构（登录后可见，保留项在、删除项不在）
+# ============================================================
 
-def test_index_keeps_core_sections(web_routes_client):
-    resp = web_routes_client.get("/")
+def test_index_keeps_core_sections(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.get("/")
     assert resp.status == 200
     for anchor in ("channelTabs", "accList", "pushBtn", "testBtn", "publicIp", "csrf-token"):
         assert anchor in resp.text
 
 
-def test_index_drops_removed_sections(web_routes_client):
-    resp = web_routes_client.get("/")
+def test_index_drops_removed_sections(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.get("/")
     assert resp.status == 200
     for absent in (
         "loginBtn",
@@ -62,10 +104,11 @@ def test_index_drops_removed_sections(web_routes_client):
         assert absent not in resp.text
 
 
-def test_index_renders_session_csrf(web_routes_client):
-    resp = web_routes_client.get("/")
+def test_index_renders_session_csrf(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.get("/")
     assert resp.status == 200
-    # 会话级 csrf 注入 <meta name="csrf-token">（Task 4 接入 auth_guard 后生效）
     assert re.search(r'<meta name="csrf-token" content="[^"]+"', resp.text)
 
 
@@ -85,6 +128,260 @@ def test_build_app_exists():
 
 
 def test_import_is_clean():
-    """import web 不应触发登录/autostart 相关模块加载。"""
+    """import web 不应触发个人版登录/autostart 相关模块加载。"""
     assert "push_server.login" not in sys.modules
     assert "push_server.autostart" not in sys.modules
+
+
+# ============================================================
+# Task 4：auth_guard 中间件 / 登录与设置 / 健康检查
+# ============================================================
+
+# ---------- 免鉴权路径 ----------
+
+def test_healthz_no_auth(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/healthz")
+    assert resp.status == 200
+    assert resp.data["ok"] is True
+    assert resp.data["version"] == __version__
+    assert resp.data["scheduler"] == "stopped"
+
+
+def test_healthz_reports_running(web_client_factory):
+    class _FakeTask:
+        def __init__(self, done: bool):
+            self._done = done
+
+        def done(self) -> bool:
+            return self._done
+
+    client = web_client_factory(web.build_app())
+    web.set_scheduler_task(_FakeTask(False))
+    try:
+        assert client.get("/healthz").data["scheduler"] == "running"
+    finally:
+        web.set_scheduler_task(None)
+    assert client.get("/healthz").data["scheduler"] == "stopped"
+
+
+def test_index_redirects_when_uninitialized(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/setup"
+
+
+def test_index_redirects_to_login_when_initialized(web_client_factory):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    resp = client.get("/", allow_redirects=False)
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/login"
+
+
+def test_api_requires_session(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/api/status", allow_redirects=False)
+    assert resp.status == 401
+    assert resp.data == {"ok": False, "code": "unauthorized"}
+
+
+# ---------- 设置页 / 登录页 ----------
+
+def test_setup_and_login_pages_render(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/setup")
+    assert resp.status == 200 and "设置码" in resp.text
+    resp = client.get("/login")
+    # 未初始化时 /login 引导回 /setup
+    assert resp.status == 200
+    assert "访问口令" in resp.text or "设置码" in resp.text
+
+
+def test_setup_redirects_to_login_when_initialized(web_client_factory):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    resp = client.get("/setup", allow_redirects=False)
+    assert resp.status == 302 and resp.headers["Location"] == "/login"
+
+
+def test_api_setup_requires_requested_with(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.post("/api/setup", json={"setup_code": "x", "password": PASSWORD})
+    assert resp.status == 403
+
+
+def test_api_setup_wrong_code_rejected(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.post(
+        "/api/setup", json={"setup_code": "00000000", "password": PASSWORD}, headers=RW
+    )
+    assert resp.status == 400
+
+
+def test_api_setup_success_creates_session(web_client_factory):
+    code = auth.ensure_setup_code()
+    client = web_client_factory(web.build_app())
+    resp = client.post(
+        "/api/setup", json={"setup_code": code, "password": PASSWORD}, headers=RW
+    )
+    assert resp.status == 200 and resp.data["ok"]
+    resp = client.get("/")
+    assert resp.status == 200
+    assert '<meta name="csrf-token"' in resp.text
+
+
+# ---------- 登录 ----------
+
+def test_api_login_success_and_failure(web_client_factory):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    resp = client.post("/api/login", json={"password": "错误口令-000"}, headers=RW)
+    assert resp.status == 401
+    resp = client.post("/api/login", json={"password": PASSWORD}, headers=RW)
+    assert resp.status == 200 and resp.data["ok"]
+    assert client.get("/").status == 200
+
+
+def test_login_rate_limit_lockout_and_recovery(web_client_factory, monkeypatch):
+    monkeypatch.setattr(auth, "FAIL_DELAY", 0)
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    statuses = []
+    for _ in range(auth.LOCK_THRESHOLD):
+        resp = client.post("/api/login", json={"password": "wrong-pass-1"}, headers=RW)
+        statuses.append(resp.status)
+    assert 401 in statuses and 429 in statuses  # 前几次 401，触发锁定后 429
+    resp = client.post("/api/login", json={"password": "wrong-pass-1"}, headers=RW)
+    assert resp.status == 429
+    assert "分钟" in resp.data["message"]
+    # 正确口令仍可登录（成功登录即清零）
+    resp = client.post("/api/login", json={"password": PASSWORD}, headers=RW)
+    assert resp.status == 200
+    resp = client.post("/api/login", json={"password": "wrong-pass-1"}, headers=RW)
+    assert resp.status == 401  # 计数已重置，重新累计
+
+
+# ---------- CSRF 会话级 ----------
+
+def test_write_api_requires_session_csrf(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.post("/api/logout", json={})
+    assert resp.status == 403  # 缺 CSRF / X-Requested-With
+    token = _csrf_of(client)
+    resp = client.post("/api/logout", json={}, headers={**RW, "X-CSRF-Token": token})
+    assert resp.status == 200
+
+
+def test_csrf_is_session_scoped(web_client_factory):
+    _setup_password()
+    a = _login(web_client_factory)
+    b = _login(web_client_factory)
+    token_a, token_b = _csrf_of(a), _csrf_of(b)
+    assert token_a != token_b
+    resp = b.post("/api/logout", json={}, headers={**RW, "X-CSRF-Token": token_a})
+    assert resp.status == 403  # A 的令牌不能用于 B 的会话
+
+
+def test_logout_drops_session(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    resp = client.post("/api/logout", json={}, headers={**RW, "X-CSRF-Token": token})
+    assert resp.status == 200
+    resp = client.get("/api/status", allow_redirects=False)
+    assert resp.status == 401
+
+
+# ---------- 同源校验 ----------
+
+def test_cross_site_origin_blocked(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/api/status", headers={"Origin": "https://evil.example"})
+    assert resp.status == 403
+
+
+def test_cross_site_fetch_site_blocked(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/api/status", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status == 403
+
+
+def test_same_origin_allowed(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    resp = client.post(
+        "/api/logout",
+        json={},
+        headers={**RW, "X-CSRF-Token": token, "Origin": "http://127.0.0.1:54321"},
+    )
+    assert resp.status == 200  # Host 同主机名的 Origin 视为同源
+
+
+# ---------- Cookie 属性 ----------
+
+def _cookie_header(resp) -> str:
+    return resp.headers.get("Set-Cookie", "")
+
+
+def test_session_cookie_attributes_plain_http(web_client_factory):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    resp = client.post("/api/login", json={"password": PASSWORD}, headers=RW)
+    cookie = _cookie_header(resp).lower()
+    assert "httponly" in cookie
+    assert "samesite=strict" in cookie
+    assert "path=/" in cookie
+    assert "max-age=604800" in cookie
+    assert "secure" not in cookie  # 明文 HTTP 不加 Secure
+
+
+def test_session_cookie_secure_on_forwarded_https(web_client_factory):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    resp = client.post(
+        "/api/login",
+        json={"password": PASSWORD},
+        headers={**RW, "X-Forwarded-Proto": "https"},
+    )
+    assert "secure" in _cookie_header(resp).lower()
+
+
+def test_cookie_secure_env_override(web_client_factory, monkeypatch):
+    _setup_password()
+    client = web_client_factory(web.build_app())
+    monkeypatch.setenv("VAL_SERVER_COOKIE_SECURE", "0")
+    resp = client.post(
+        "/api/login",
+        json={"password": PASSWORD},
+        headers={**RW, "X-Forwarded-Proto": "https"},
+    )
+    assert "secure" not in _cookie_header(resp).lower()
+    monkeypatch.setenv("VAL_SERVER_COOKIE_SECURE", "1")
+    resp = client.post("/api/login", json={"password": PASSWORD}, headers=RW)
+    assert "secure" in _cookie_header(resp).lower()
+
+
+# ---------- 会话生命周期 ----------
+
+def test_session_expires_after_ttl(web_client_factory, monkeypatch):
+    _setup_password()
+    client = _login(web_client_factory)
+    future = time.time() + auth.SESSION_TTL + 10
+    monkeypatch.setattr(auth.time, "time", lambda: future)
+    resp = client.get("/api/status", allow_redirects=False)
+    assert resp.status == 401
+
+
+def test_session_sliding_reissue(web_client_factory, monkeypatch):
+    _setup_password()
+    client = _login(web_client_factory)
+    future = time.time() + auth.SESSION_REISSUE + 10
+    monkeypatch.setattr(auth.time, "time", lambda: future)
+    resp = client.get("/", allow_redirects=False)
+    assert resp.status == 200
+    cookie = _cookie_header(resp).lower()
+    assert "max-age=604800" in cookie  # 重签 cookie，浏览器续期

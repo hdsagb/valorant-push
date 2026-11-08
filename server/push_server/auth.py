@@ -186,5 +186,6 @@ def lock_remaining() -> float:
 
 
 def reset_failures() -> None:
-    global _fail_count
-    _fail_count = 0
+    """成功登录即清零：失败计数与锁定同时清除（§0 决策 6）。"""
+    global _fail_count, _lock_until
+    _fail_count, _lock_until = 0, 0.0
