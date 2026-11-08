@@ -39,6 +39,7 @@ OUT_DIR = DATA_DIR / "out"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 STATE_FILE = DATA_DIR / "state.json"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+AUTH_FILE = DATA_DIR / "auth.json"
 LOG_FILE = DATA_DIR / "app.log"
 
 _dirs_ready: set[str] = set()

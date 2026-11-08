@@ -29,6 +29,7 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(paths, "SETTINGS_FILE", data / "settings.json")
     monkeypatch.setattr(paths, "STATE_FILE", data / "state.json")
     monkeypatch.setattr(paths, "ACCOUNTS_FILE", data / "accounts.json")
+    monkeypatch.setattr(paths, "AUTH_FILE", data / "auth.json")
     monkeypatch.setattr(paths, "LOG_FILE", data / "app.log")
     yield data
     crypto.reset_key_cache()
