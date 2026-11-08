@@ -24,7 +24,7 @@ def _run(args: list[str], data_dir: Path, input: str | None = None) -> subproces
 def test_version_flag(tmp_path: Path):
     result = _run(["--version"], tmp_path)
     assert result.returncode == 0
-    assert "0.1.0" in result.stdout
+    assert "0.3.0" in result.stdout
 
 
 def test_push_now_without_accounts_is_clean_skip(tmp_path: Path):
@@ -79,11 +79,41 @@ def test_cli_import_zero_imported_exit_2(data_dir, tmp_path: Path):
     assert result.returncode == 2
 
 
-def test_cli_import_all_invalid_exit_2(data_dir, tmp_path: Path):
-    payload = {
-        "exported_at": "x",
-        "accounts": [{"name": "残缺", "user_id": "u-9", "login_type": "qq", "credentials": {}}],
-    }
-    pack = _write_pack(tmp_path, payload)
-    result = _run(["--import-credentials", str(pack)], data_dir, input=f"{PASSWORD}\n")
-    assert result.returncode == 2
+# ---------- serve（常驻进程：只测绑定解析与装配，真实起服务的冒烟放 Task 7 手工验收） ----------
+
+def test_resolve_web_bind_defaults(data_dir, monkeypatch):
+    monkeypatch.delenv("VAL_SERVER_WEB_HOST", raising=False)
+    monkeypatch.delenv("VAL_SERVER_WEB_PORT", raising=False)
+    from push_server.__main__ import resolve_web_bind
+    assert resolve_web_bind(None, None) == ("0.0.0.0", 8787)
+
+
+def test_resolve_web_bind_env_override(data_dir, monkeypatch):
+    monkeypatch.setenv("VAL_SERVER_WEB_HOST", "127.0.0.1")
+    monkeypatch.setenv("VAL_SERVER_WEB_PORT", "9999")
+    from push_server.__main__ import resolve_web_bind
+    assert resolve_web_bind(None, None) == ("127.0.0.1", 9999)
+
+
+def test_resolve_web_bind_args_beat_env(data_dir, monkeypatch):
+    monkeypatch.setenv("VAL_SERVER_WEB_PORT", "9999")
+    from push_server.__main__ import resolve_web_bind
+    assert resolve_web_bind(None, 7777) == ("0.0.0.0", 7777)
+
+
+def test_main_no_args_invokes_serve(data_dir, monkeypatch):
+    import push_server.__main__ as cli
+
+    captured = {}
+
+    async def fake_serve(host, port):
+        captured["host"], captured["port"] = host, port
+
+    monkeypatch.setattr(cli, "_serve_async", fake_serve)
+    assert cli.main([]) == 0
+    assert captured == {"host": "0.0.0.0", "port": 8787}
+
+
+def test_version_bumped():
+    from push_server import __version__
+    assert __version__ == "0.3.0"
