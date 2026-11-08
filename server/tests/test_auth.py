@@ -1,6 +1,8 @@
 """auth.py 测试：口令哈希 / 设置码 / 会话 / 限速。运行：python -m pytest server/tests/test_auth.py -v"""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from push_server import auth
@@ -79,3 +81,89 @@ def test_hash_format(data_dir):
 def paths_auth_record() -> bytes:
     from push_server import paths
     return paths.AUTH_FILE.read_text(encoding="utf-8")
+
+
+# ---------- 会话（追加） ----------
+
+def test_session_lifecycle(data_dir):
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+    token, csrf = auth.create_session()
+    assert token and csrf and token != csrf
+    session = auth.get_session(token)
+    assert session["csrf"] == csrf
+
+
+def test_session_bad_token(data_dir):
+    assert auth.get_session("no-such-token") is None
+    assert auth.get_session("") is None
+
+
+def test_session_expiry(data_dir, monkeypatch):
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+    token, _ = auth.create_session()
+    future = time.time() + auth.SESSION_TTL + 1
+    monkeypatch.setattr(auth.time, "time", lambda: future)
+    assert auth.get_session(token) is None
+
+
+def test_session_sliding_extends(data_dir, monkeypatch):
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+    token, _ = auth.create_session()
+    session = auth.get_session(token)
+    first_seen = session["last_seen"]
+    future = time.time() + 3600
+    monkeypatch.setattr(auth.time, "time", lambda: future)
+    session = auth.get_session(token)
+    assert session["last_seen"] >= first_seen + 3600 - 5
+
+
+def test_drop_session(data_dir):
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+    token, _ = auth.create_session()
+    auth.drop_session(token)
+    assert auth.get_session(token) is None
+
+
+def test_should_reissue(data_dir):
+    code = auth.ensure_setup_code()
+    auth.set_password(PASSWORD, code)
+    token, _ = auth.create_session()
+    session = auth.get_session(token)
+    assert auth.should_reissue(session) is False          # 刚签发不重签
+    session["issued_at"] -= auth.SESSION_REISSUE + 1
+    assert auth.should_reissue(session) is True
+
+
+# ---------- 限速（追加） ----------
+
+def test_rate_limit_lockout_after_threshold(data_dir):
+    for _ in range(auth.LOCK_THRESHOLD):
+        auth.register_failure()
+    assert auth.lock_remaining() > 0
+
+
+def test_rate_limit_lock_expires(data_dir, monkeypatch):
+    for _ in range(auth.LOCK_THRESHOLD):
+        auth.register_failure()
+    future = time.time() + auth.LOCK_SECONDS + 1
+    monkeypatch.setattr(auth.time, "time", lambda: future)
+    assert auth.lock_remaining() == 0
+
+
+def test_rate_limit_prolonged_by_failures_during_lock(data_dir):
+    for _ in range(auth.LOCK_THRESHOLD):
+        auth.register_failure()
+    first = auth.lock_remaining()
+    auth.register_failure()  # 锁定期内再失败：剩余时长翻倍
+    assert auth.lock_remaining() >= first * 2 - 1
+
+
+def test_rate_limit_reset_on_success(data_dir):
+    auth.register_failure()
+    auth.register_failure()
+    auth.reset_failures()
+    assert auth.lock_remaining() == 0

@@ -124,3 +124,67 @@ def verify_password(password: str) -> bool:
     expected = base64.b64decode(state["hash"])
     digest = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, state["iterations"], dklen=KEY_LEN)
     return secrets.compare_digest(digest, expected)
+
+
+# ---------- 会话 ----------
+
+def create_session() -> tuple[str, str]:
+    """新建会话，返回 (token, csrf)。token 走 cookie，csrf 注入页面。"""
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    _sessions[token] = {"csrf": secrets.token_urlsafe(32), "issued_at": now, "last_seen": now}
+    return token, _sessions[token]["csrf"]
+
+
+def get_session(token: str) -> dict | None:
+    session = _sessions.get(token)
+    if session is None:
+        return None
+    now = time.time()
+    if now - session["last_seen"] > SESSION_TTL:
+        _sessions.pop(token, None)
+        return None
+    session["last_seen"] = now
+    return session
+
+
+def drop_session(token: str) -> None:
+    _sessions.pop(token, None)
+
+
+def should_reissue(session: dict) -> bool:
+    """距 cookie 签发超 24h 则重签（滑动续期，防止长期活跃用户被登出）。"""
+    return time.time() - session["issued_at"] > SESSION_REISSUE
+
+
+def session_cookie_kwargs(secure: bool, max_age: int = SESSION_TTL) -> dict:
+    return {
+        "max_age": max_age,
+        "path": "/",
+        "httponly": True,
+        "samesite": "Strict",
+        "secure": secure,
+    }
+
+
+# ---------- 登录限速 ----------
+
+def register_failure() -> None:
+    global _fail_count, _lock_until
+    now = time.time()
+    if now < _lock_until:
+        _lock_until = now + (_lock_until - now) * 2  # 锁定期内再失败：剩余时长翻倍
+        return
+    _fail_count += 1
+    if _fail_count >= LOCK_THRESHOLD:
+        _lock_until = now + LOCK_SECONDS
+        _fail_count = 0
+
+
+def lock_remaining() -> float:
+    return max(0.0, _lock_until - time.time())
+
+
+def reset_failures() -> None:
+    global _fail_count
+    _fail_count = 0
