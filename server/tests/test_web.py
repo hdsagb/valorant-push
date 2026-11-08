@@ -385,3 +385,78 @@ def test_session_sliding_reissue(web_client_factory, monkeypatch):
     assert resp.status == 200
     cookie = _cookie_header(resp).lower()
     assert "max-age=604800" in cookie  # 重签 cookie，浏览器续期
+
+
+# ============================================================
+# Task 5：凭证导入卡片 + /api/credentials/import
+# ============================================================
+
+import base64  # noqa: E402
+
+from push_server import accounts, paths  # noqa: E402
+from test_credpack import (  # noqa: E402
+    PASSWORD as PACK_PASSWORD,
+    make_pack,
+    sample_payload,
+)
+
+
+def test_import_credentials_success(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    content_b64 = base64.b64encode(make_pack(sample_payload(), PACK_PASSWORD)).decode()
+    resp = client.post(
+        "/api/credentials/import",
+        json={"content_b64": content_b64, "password": PACK_PASSWORD},
+        headers={**RW, "X-CSRF-Token": token},
+    )
+    assert resp.status == 200
+    assert resp.data["added"] == 1 and resp.data["updated"] == 0
+    # R6 句式 + 删除提醒必须出现在返回消息里
+    assert "请在个人版停止" in resp.data["message"]
+    assert "删除" in resp.data["message"]
+    assert accounts.count() == 1
+    disk = paths.ACCOUNTS_FILE.read_text(encoding="utf-8")
+    assert "enc:v1:" in disk and "t-0001" not in disk  # 凭证加密落盘、明文 tid 不出现
+
+
+def test_import_credentials_wrong_password(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    content_b64 = base64.b64encode(make_pack(sample_payload(), PACK_PASSWORD)).decode()
+    resp = client.post(
+        "/api/credentials/import",
+        json={"content_b64": content_b64, "password": "错误的口令-999999"},
+        headers={**RW, "X-CSRF-Token": token},
+    )
+    assert resp.status == 400
+    assert "口令错误或凭证包已损坏" in resp.data["message"]
+
+
+def test_import_credentials_oversized_rejected(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    resp = client.post(
+        "/api/credentials/import",
+        json={
+            "content_b64": base64.b64encode(b"x" * (2 * 1024 * 1024)).decode(),
+            "password": PACK_PASSWORD,
+        },
+        headers={**RW, "X-CSRF-Token": token},
+    )
+    assert resp.status == 400
+
+
+def test_import_requires_csrf(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    content_b64 = base64.b64encode(make_pack(sample_payload(), PACK_PASSWORD)).decode()
+    resp = client.post(
+        "/api/credentials/import",
+        json={"content_b64": content_b64, "password": PACK_PASSWORD},
+        headers=RW,  # 无 X-CSRF-Token
+    )
+    assert resp.status == 403

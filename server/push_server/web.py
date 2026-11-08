@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import __version__, accounts, auth, config, paths, pipeline, scheduler
+from . import __version__, accounts, auth, config, credpack, paths, pipeline, scheduler
 from .channels import ChannelError
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -222,6 +222,31 @@ async def api_accounts_remove(request: web.Request) -> web.Response:
     )
 
 
+@routes.post("/api/credentials/import")
+async def api_credentials_import(request: web.Request) -> web.Response:
+    body = await request.json()
+    password = str(body.get("password") or "")
+    try:
+        raw = base64.b64decode(str(body.get("content_b64") or ""), validate=True)
+    except Exception:
+        return web.json_response({"ok": False, "message": "不是有效的凭证包文件"}, status=400)
+    try:
+        payload = credpack.parse_pack(raw, password)
+    except credpack.CredpackError as exc:
+        return web.json_response({"ok": False, "message": str(exc)}, status=400)
+
+    result = credpack.import_accounts(payload)
+    message = f"导入完成：新增 {result['added']} 个，更新 {result['updated']} 个"
+    if result["skipped"]:
+        message += f"，跳过 {len(result['skipped'])} 个"
+    message += "。请在个人版停止这些账号的定时推送，并删除本地导出的凭证包文件。"
+    logger.info("凭证导入：%s", message)
+    return web.json_response(
+        {"ok": True, "message": message, "added": result["added"],
+         "updated": result["updated"], "skipped": result["skipped"]}
+    )
+
+
 @routes.get("/api/settings")
 async def api_settings(_: web.Request) -> web.Response:
     return web.json_response(config.mask_settings(config.load_settings()))
@@ -337,8 +362,15 @@ async def favicon(_: web.Request) -> web.Response:
 
 
 def build_app() -> web.Application:
-    """装配管理界面应用（中间件 + 路由）；启动由 __main__ 的 serve 模式负责。"""
-    app = web.Application(middlewares=[auth_guard])
+    """装配管理界面应用（中间件 + 路由）；启动由 __main__ 的 serve 模式负责。
+
+    client_max_size 放宽到 4MB：凭证包本体上限 1MB（credpack.MAX_FILE_BYTES），
+    base64 编码后约 1.4MB，超限包应进入路由由 parse_pack 统一返回 400，
+    而非被 aiohttp 默认 body 上限以 413 拦截。
+    """
+    app = web.Application(
+        middlewares=[auth_guard], client_max_size=4 * 1024 * 1024
+    )
     app.add_routes(routes)
     return app
 
@@ -595,7 +627,15 @@ INDEX_HTML = r'''<!doctype html>
   </div>
 
   <div class="grid">
-    <!-- 卡片 1：凭证导入卡片由 Task 5 提供 -->
+    <section class="card">
+      <h2>1 · 导入游戏账号 <span class="tag">国服</span></h2>
+      <p class="hint">在个人版「已绑定账号」卡片点「导出凭证包」生成 .vpcred 文件，再在此导入。凭证包只在导入时解密使用，不会保存在服务器上。</p>
+      <label class="field"><span>凭证包文件（.vpcred）</span><input id="importFile" type="file" accept=".vpcred"></label>
+      <label class="field"><span>凭证包口令</span><input id="importPass" type="password" placeholder="导出时设置的口令"></label>
+      <button class="action primary" id="importBtn">导入账号</button>
+      <span class="inline-msg" id="importMsg"></span>
+      <p class="hint">导入成功后请在个人版停止这些账号的定时推送（同一账号凭证只在一端启用推送），并删除本地的导出文件。</p>
+    </section>
 
     <section class="card">
       <h2>2 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
@@ -1009,6 +1049,28 @@ async function removeAccount(account) {
   }
 }
 
+async function importCredentials() {
+  const fileInput = $('importFile'), pass = $('importPass').value;
+  if (!fileInput.files.length) { setMsg('importMsg', '请选择凭证包文件', 'warn'); return; }
+  if (pass.length < 8) { setMsg('importMsg', '口令至少 8 位', 'warn'); return; }
+  const file = fileInput.files[0];
+  if (file.size > 1024 * 1024) { setMsg('importMsg', '文件过大，不是有效的凭证包', 'warn'); return; }
+  const buf = new Uint8Array(await file.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+  $('importBtn').disabled = true;
+  try {
+    const data = await api('/api/credentials/import', {
+      method: 'POST', body: JSON.stringify({ content_b64: btoa(bin), password: pass }),
+    });
+    setMsg('importMsg', data.message, 'ok');
+    toast(data.message, 'ok');
+    $('importFile').value = ''; $('importPass').value = '';
+    loadAll();
+  } catch (e) { setMsg('importMsg', e.message, 'err'); }
+  $('importBtn').disabled = false;
+}
+
 async function loadAll() {
   try {
     const [status, settings] = await Promise.all([api('/api/status'), api('/api/settings')]);
@@ -1149,6 +1211,7 @@ $('nameModal').addEventListener('click', (e) => {
   if (e.target === $('nameModal')) closeNameModal();
 });
 $('testBtn').addEventListener('click', testChannel);
+$('importBtn').addEventListener('click', importCredentials);
 $('ipRefresh').addEventListener('click', () => detectPublicIp());
 $('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
