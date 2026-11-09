@@ -1,3 +1,21 @@
-{$DOMAIN} {
+# 域名在 Web 初始化向导中绑定（存 settings.json），本文件不含任何具体域名。
+# on-demand TLS + ask：TLS 握手遇到未知 SNI 时，Caddy 向应用 /api/caddy-ask 征询许可，
+# 仅已绑定域名获准按需签发证书（ask 返回 403 = 拒绝签发，不会为其它域名服务）。
+# 语法核对（2026-11-09，caddyserver.com 文档）：全局 on_demand_tls { ask } 必须与
+# 站点内 tls { on_demand } 同时配置方可启用按需签发，两者缺一不可。
+{
+	on_demand_tls {
+		ask http://push_server:8787/api/caddy-ask
+	}
+}
+
+http:// {
+	reverse_proxy push_server:8787
+}
+
+https:// {
+	tls {
+		on_demand
+	}
 	reverse_proxy push_server:8787
 }

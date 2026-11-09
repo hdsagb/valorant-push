@@ -8,6 +8,7 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
+      - DOMAIN=${DOMAIN:-}   # 仅作旧部署迁移种子（serve 启动种入 settings，之后可删）；新部署在向导绑域名，无需填写
       # 主密钥二选一：不设则自动生成 /data/master.key（务必按 README 备份）；
       # 如固定密钥，把下行注释去掉并在 .env 里填 VAL_SERVER_MASTER_KEY
       # - VAL_SERVER_MASTER_KEY=${VAL_SERVER_MASTER_KEY}
@@ -25,8 +26,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-    environment:
-      - DOMAIN=${DOMAIN:?请先复制 .env.example 为 .env 并设置 DOMAIN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
