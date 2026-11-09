@@ -21,7 +21,7 @@ from pathlib import Path
 
 from aiohttp import web as aio_web
 
-from . import __version__, auth, credpack, paths, pipeline, scheduler
+from . import __version__, auth, config, credpack, paths, pipeline, scheduler
 from . import web as web_module
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,8 @@ def resolve_web_bind(host: str | None, port: int | None) -> tuple[str, int]:
 
 async def _serve_async(host: str, port: int) -> None:
     """常驻 serve：管理界面 + 定时推送同一事件循环；Ctrl+C/进程终止时清理。"""
+    # 旧部署迁移种子（M4.5 决策 4）：仅 serve 路径调用，--push-now/--import-credentials 不调
+    config.seed_domain_from_env()
     if not auth.is_initialized():
         auth.ensure_setup_code()  # 首次启动生成一次性设置码并打印到日志
     web_app = web_module.build_app()
