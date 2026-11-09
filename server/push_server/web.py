@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
 from aiohttp import web
 
 from . import __version__, accounts, auth, config, credpack, paths, pipeline, scheduler
@@ -31,7 +32,11 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # 免鉴权路径（设计规格表）：健康检查、登录/设置页与进入会话的前置接口、favicon
 SAFE_PATHS = frozenset({"/healthz", "/login", "/setup", "/favicon.ico"})
-SAFE_API_PATHS = frozenset({"/api/login", "/api/setup"})
+# /api/caddy-ask 免鉴权：Caddy on-demand TLS 回源征询不带任何会话/自定义头
+SAFE_API_PATHS = frozenset({"/api/login", "/api/setup", "/api/caddy-ask"})
+
+# http→https 引导重定向仅覆盖的页面 GET（决策 7：不动 /api/*，不影响 ask 回源与 ACME）
+_REDIRECT_PAGE_PATHS = frozenset({"/", "/login", "/setup"})
 
 _scheduler_task: asyncio.Task | None = None
 
@@ -69,6 +74,26 @@ def _cross_site(request: web.Request) -> bool:
     return bool(fetch_site) and fetch_site not in {"same-origin", "none"}
 
 
+def _needs_https_redirect(request: web.Request, path: str) -> bool:
+    """http→https 引导重定向判定（M4.5 决策 7）。
+
+    仅当：GET/HEAD 页面路径、原生 http 到达、无反代 X-Forwarded-Proto（形态二恒存在故
+    永不触发）、已绑定域名且请求 Host 主机名与之一致（直连 IP / ask 回源不匹配）。
+    """
+    if request.method not in {"GET", "HEAD"} or path not in _REDIRECT_PAGE_PATHS:
+        return False
+    if request.url.scheme != "http" or request.headers.get("X-Forwarded-Proto"):
+        return False
+    bound = config.load_settings().get("domain", "")
+    if not bound:
+        return False
+    try:
+        req_host = urlsplit(f"http://{request.host or ''}").hostname or ""
+    except ValueError:
+        return False
+    return req_host.rstrip(".") == bound
+
+
 @web.middleware
 async def auth_guard(request: web.Request, handler):
     """取代个人版 local_only：会话鉴权 + 会话级 CSRF + 同源校验（M3 设计规格表）。
@@ -82,6 +107,9 @@ async def auth_guard(request: web.Request, handler):
     path = request.path
     if path == "/healthz":
         return await handler(request)
+    if _needs_https_redirect(request, path):
+        bound = config.load_settings()["domain"]
+        raise web.HTTPFound(f"https://{bound}{path}")
     if _cross_site(request):
         return web.Response(status=403, text="cross-site request blocked")
     if path in SAFE_API_PATHS:
@@ -153,6 +181,7 @@ def _masked_status() -> dict[str, Any]:
         "expired_accounts": expired_names,
         "auth_expired": auth_expired,
         "channel": settings["channel"],
+        "domain": settings["domain"],
         "email_configured": config.email_configured(settings),
         "wecom_configured": config.channel_configured(settings, "wecom"),
         "config_problems": config.validate(settings),
@@ -409,11 +438,26 @@ async def api_setup(request: web.Request) -> web.Response:
             {"ok": False, "message": "访问密码已设置，请直接登录"}, status=409
         )
     body = await request.json()
+    # 绑定域名（可选）先行校验：非法直接 400，不产生任何副作用（口令尚未设置）
+    domain = ""
+    domain_raw = str(body.get("domain") or "").strip()
+    if domain_raw:
+        try:
+            domain = config.normalize_bound_domain(domain_raw)
+        except ValueError as exc:
+            return web.json_response(
+                {"ok": False, "message": f"域名格式不正确：{exc}"}, status=400
+            )
     try:
         auth.set_password(str(body.get("password") or ""), str(body.get("setup_code") or ""))
     except auth.AuthError as exc:
         return web.json_response({"ok": False, "message": str(exc)}, status=400)
-    return _start_session(request)
+    if domain:
+        settings = config.load_settings()
+        settings["domain"] = domain
+        config.save_settings(settings)
+        logger.info("初始化向导绑定域名：%s", domain)
+    return _start_session(request, bound_domain=domain)
 
 
 @routes.post("/api/login")
@@ -435,9 +479,11 @@ async def api_login(request: web.Request) -> web.Response:
     return web.json_response({"ok": False, "message": "口令错误"}, status=401)
 
 
-def _start_session(request: web.Request) -> web.Response:
+def _start_session(request: web.Request, bound_domain: str = "") -> web.Response:
     token, _ = auth.create_session()
-    response = web.json_response({"ok": True, "redirect": "/"})
+    response = web.json_response(
+        {"ok": True, "redirect": "/", "bound_domain": bound_domain}
+    )
     response.set_cookie(
         auth.SESSION_COOKIE, token, **auth.session_cookie_kwargs(_cookie_secure(request))
     )
@@ -450,6 +496,65 @@ async def api_logout(request: web.Request) -> web.Response:
     response = web.json_response({"ok": True})
     response.del_cookie(auth.SESSION_COOKIE, path="/")
     return response
+
+
+@routes.get("/api/caddy-ask")
+async def api_caddy_ask(request: web.Request) -> web.Response:
+    """Caddy on-demand TLS 征询端点（M4.5）：仅对已绑定域名放行证书签发。
+
+    Caddy TLS 握手遇到未知 SNI 时回源 GET 本端点（?domain=<sni>），200=允许按需
+    签发、403=拒绝——由此保证只为向导绑定的域名签发/服务，其它域名一律拒绝。
+    """
+    try:
+        domain = config.normalize_bound_domain(request.query.get("domain", ""))
+    except ValueError:
+        return web.Response(status=403)
+    if domain == config.load_settings().get("domain", ""):
+        logger.debug("caddy-ask：放行已绑定域名 %s", domain)
+        return web.Response(status=200)
+    logger.info("caddy-ask：拒绝未绑定域名 %s", domain)
+    return web.Response(status=403)
+
+
+async def _probe_domain(domain: str) -> dict[str, Any]:
+    """服务端实测 https://<域名>/healthz（总超时 5s），按异常分类 state。
+
+    独立成模块级函数便于测试 monkeypatch（测试不实测外网）。
+    state ∈ ok / dns_error / tls_error / http_error / timeout（not_bound 由调用方处理）。
+    """
+    url = f"https://{domain}/healthz"
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, raise_for_status=True):
+                return {"state": "ok", "message": "HTTPS 访问正常，域名与证书均已就绪"}
+    except aiohttp.ClientConnectorCertificateError:
+        return {"state": "tls_error", "message": "证书无效（未就绪/过期/域名不匹配），稍后重试或检查反代证书"}
+    except aiohttp.ClientConnectorSSLError:
+        return {"state": "tls_error", "message": "TLS 握手失败：证书未就绪，稍后重试"}
+    except aiohttp.ClientConnectorDNSError:
+        return {"state": "dns_error", "message": "DNS 解析失败：域名记录未指向本服务器或尚未生效"}
+    except aiohttp.ClientConnectorError:
+        return {"state": "dns_error", "message": "无法建立连接：DNS 未生效或 443 端口不可达"}
+    except aiohttp.ClientResponseError as exc:
+        return {"state": "http_error", "message": f"反代返回 HTTP {exc.status}：站点未指向本服务或应用未就绪"}
+    except asyncio.TimeoutError:
+        return {"state": "timeout", "message": "连接超时：网络或应用未就绪，稍后重试"}
+    except aiohttp.ClientError as exc:
+        return {"state": "http_error", "message": f"请求失败：{exc}"}
+
+
+@routes.get("/api/domain-check")
+async def api_domain_check(_: web.Request) -> web.Response:
+    """域名自检（M4.5，需登录）：服务端实测绑定域名的 HTTPS 可达性。"""
+    domain = config.load_settings().get("domain", "")
+    if not domain:
+        return web.json_response(
+            {"ok": False, "domain": "", "state": "not_bound", "message": "尚未绑定域名"}
+        )
+    result = await _probe_domain(domain)
+    return web.json_response({"ok": result["state"] == "ok", "domain": domain, **result})
+
 
 INDEX_HTML = r'''<!doctype html>
 <html lang="zh-CN">
@@ -624,7 +729,9 @@ INDEX_HTML = r'''<!doctype html>
     <div class="stat"><div class="k">账号</div><div class="v" id="statLogin">-</div></div>
     <div class="stat"><div class="k">下次定时推送</div><div class="v" id="statNext">-</div></div>
     <div class="stat"><div class="k">上次推送</div><div class="v" id="statLast">-</div></div>
+    <div class="stat"><div class="k">绑定域名</div><div class="v"><span id="statDomain">-</span> <button class="link" id="domainCheckBtn" hidden>检查</button></div></div>
   </div>
+  <p class="hint" id="domainMsg" hidden></p>
 
   <div class="grid">
     <section class="card">
@@ -912,6 +1019,8 @@ function renderStatus(s) {
   $('statLast').textContent = s.last_push_at
     ? s.last_push_at + (s.last_push_ok ? ' 成功' : ' 失败')
     : '暂无记录';
+  $('statDomain').textContent = s.domain || '未绑定';
+  $('domainCheckBtn').hidden = !s.domain;
 
   const count = s.account_count || 0;
   const limit = s.account_limit || 10;
@@ -1217,6 +1326,18 @@ $('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
 $('pushBtn').addEventListener('click', pushNow);
 
+$('domainCheckBtn').addEventListener('click', async () => {
+  const msg = $('domainMsg');
+  msg.hidden = false;
+  msg.textContent = '正在检查域名（服务端实测 HTTPS 访问）…';
+  try {
+    const data = await api('/api/domain-check');
+    msg.textContent = data.message || (data.ok ? '域名可正常访问' : '检查未通过');
+  } catch (e) {
+    msg.textContent = '检查请求失败：' + (e.message || '请重试');
+  }
+});
+
 $('logoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (e) {}
   location.href = '/login';
@@ -1306,6 +1427,9 @@ SETUP_HTML = """<!DOCTYPE html>
   <input id="password" type="password" autocomplete="new-password">
   <label for="password2">再次输入口令</label>
   <input id="password2" type="password" autocomplete="new-password">
+  <label for="domain">绑定域名（可选）</label>
+  <input id="domain" autocomplete="off" placeholder="push.example.com，留空跳过">
+  <p class="hint">内置 Caddy（80/443 空闲）：填写后自动签发证书并跳转 HTTPS；已有反向代理：填写反代中已配置的域名；直连 IP：留空。当前为 HTTP 明文连接。</p>
   <button id="go">完成设置</button>
   <p class="msg" id="msg"></p>
   <p class="hint">设置码只在首次启动时生成并打印到日志，设置成功后即失效；口令用于登录管理界面，请妥善保管。</p>
@@ -1316,6 +1440,7 @@ async function submit() {
   $('msg').textContent = '';
   const code = $('setupCode').value.trim();
   const pw = $('password').value, pw2 = $('password2').value;
+  const domain = $('domain').value.trim();
   if (!code) { $('msg').textContent = '请输入设置码'; return; }
   if (pw.length < 8) { $('msg').textContent = '口令至少 8 位'; return; }
   if (pw !== pw2) { $('msg').textContent = '两次输入的口令不一致'; return; }
@@ -1324,7 +1449,7 @@ async function submit() {
     const res = await fetch('/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'ValorantPushPersonal' },
-      body: JSON.stringify({ setup_code: code, password: pw })
+      body: JSON.stringify({ setup_code: code, password: pw, domain: domain })
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) { location.href = '/'; return; }

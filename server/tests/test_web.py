@@ -522,3 +522,143 @@ def test_test_channel_email_with_saved_host_not_500(web_client_factory, monkeypa
     )
     assert resp.status == 400  # 修复前：500（KeyError: 0）
     assert resp.data.get("ok") is False
+
+
+# ============================================================
+# M4.5 域名绑定：/api/setup domain 参数 / caddy-ask / domain-check / http→https 引导
+# ============================================================
+
+def test_api_setup_with_domain_binds(web_client_factory):
+    code = auth.ensure_setup_code()
+    client = web_client_factory(web.build_app())
+    resp = client.post(
+        "/api/setup",
+        json={"setup_code": code, "password": PASSWORD, "domain": " https://Shop.Example.com/ "},
+        headers=RW,
+    )
+    assert resp.status == 200 and resp.data["ok"]
+    assert resp.data["bound_domain"] == "shop.example.com"  # 规范化后返回
+    from push_server import config
+    assert config.load_settings()["domain"] == "shop.example.com"  # 随设置落盘
+
+
+def test_api_setup_invalid_domain_rejected_before_password(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.post(
+        "/api/setup",
+        json={"setup_code": "00000000", "password": PASSWORD, "domain": "192.168.1.1"},
+        headers=RW,
+    )
+    assert resp.status == 400
+    assert "域名" in resp.data["message"]
+    assert not auth.is_initialized()  # 校验先行：口令尚未设置
+    # 修正后可正常完成初始化
+    code = auth.ensure_setup_code()
+    resp = client.post(
+        "/api/setup", json={"setup_code": code, "password": PASSWORD}, headers=RW
+    )
+    assert resp.status == 200
+
+
+def test_caddy_ask_bound_200(web_routes_client):
+    from push_server import config
+    config.save_settings({"domain": "bound.example.com"})
+    resp = web_routes_client.get("/api/caddy-ask?domain=bound.example.com")
+    assert resp.status == 200
+
+
+def test_caddy_ask_rejects_other_and_unbound(web_routes_client):
+    from push_server import config
+    # 未绑定任何域名：一律 403
+    resp = web_routes_client.get("/api/caddy-ask?domain=anything.example.com")
+    assert resp.status == 403
+    # 已绑定：其它域名 / 空参数 / 非法值均 403
+    config.save_settings({"domain": "bound.example.com"})
+    assert web_routes_client.get("/api/caddy-ask?domain=other.example.com").status == 403
+    assert web_routes_client.get("/api/caddy-ask").status == 403
+    assert web_routes_client.get("/api/caddy-ask?domain=192.168.1.1").status == 403
+
+
+def test_caddy_ask_no_auth_via_middleware(web_client_factory):
+    """免鉴权回归：完整中间件下无任何会话/自定义头也可访问（Caddy 回源形态）。"""
+    from push_server import config
+    config.save_settings({"domain": "bound.example.com"})
+    client = web_client_factory(web.build_app())
+    assert client.get("/api/caddy-ask?domain=bound.example.com").status == 200
+    assert client.get("/api/caddy-ask?domain=other.example.com").status == 403
+
+
+def test_https_redirect_for_bound_domain(web_client_factory):
+    from push_server import config
+    config.save_settings({"domain": "bound.example.com"})
+    client = web_client_factory(web.build_app())
+    # Host == 绑定域名 → 302 到 https 同路径
+    for path in ("/", "/login", "/setup"):
+        resp = client.get(path, headers={"Host": "bound.example.com"}, allow_redirects=False)
+        assert resp.status == 302, path
+        assert resp.headers["Location"] == f"https://bound.example.com{path}", path
+
+
+def test_https_redirect_not_triggered(web_client_factory):
+    from push_server import config
+    config.save_settings({"domain": "bound.example.com"})
+    client = web_client_factory(web.build_app())
+    # Host ≠ 绑定域名
+    resp = client.get("/", headers={"Host": "other.example.com"}, allow_redirects=False)
+    assert not resp.headers.get("Location", "").startswith("https://")
+    # 反代形态：X-Forwarded-Proto 恒存在 → 永不重定向（无回环）
+    resp = client.get(
+        "/", headers={"Host": "bound.example.com", "X-Forwarded-Proto": "https"},
+        allow_redirects=False,
+    )
+    assert not resp.headers.get("Location", "").startswith("https://")
+    # API 路径不重定向（ask 回源 Host 不匹配天然不触发，此处验证 API 白名单路径）
+    resp = client.get("/api/status", headers={"Host": "bound.example.com"}, allow_redirects=False)
+    assert not resp.headers.get("Location", "").startswith("https://")
+
+
+def test_https_redirect_not_triggered_when_unbound(web_client_factory):
+    client = web_client_factory(web.build_app())
+    resp = client.get("/", headers={"Host": "bound.example.com"}, allow_redirects=False)
+    assert not resp.headers.get("Location", "").startswith("https://")
+
+
+def test_domain_check_requires_session(web_client_factory):
+    client = web_client_factory(web.build_app())
+    assert client.get("/api/domain-check").status == 401
+
+
+def test_domain_check_not_bound(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.get("/api/domain-check")
+    assert resp.status == 200
+    assert resp.data["ok"] is False
+    assert resp.data["state"] == "not_bound"
+
+
+def test_domain_check_probes_and_classifies(web_client_factory, monkeypatch):
+    from push_server import config
+    _setup_password()
+    config.save_settings({"domain": "bound.example.com"})
+    client = _login(web_client_factory)
+
+    cases = {
+        "ok": {"state": "ok", "message": "HTTPS 访问正常"},
+        "dns_error": {"state": "dns_error", "message": "DNS 解析失败"},
+        "tls_error": {"state": "tls_error", "message": "证书未就绪"},
+        "http_error": {"state": "http_error", "message": "反代返回 HTTP 502"},
+        "timeout": {"state": "timeout", "message": "连接超时"},
+    }
+    for state, payload in cases.items():
+        async def fake_probe(domain, _payload=payload):
+            assert domain == "bound.example.com"
+            return dict(_payload)
+
+        monkeypatch.setattr(web, "_probe_domain", fake_probe)
+        resp = client.get("/api/domain-check")
+        assert resp.status == 200
+        assert resp.data["domain"] == "bound.example.com"
+        assert resp.data["state"] == state
+        assert resp.data["ok"] is (state == "ok")
+        assert resp.data["message"] == payload["message"]
