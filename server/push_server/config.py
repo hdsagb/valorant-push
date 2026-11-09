@@ -6,10 +6,14 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import crypto, paths
 
@@ -33,6 +37,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "schedule_enabled": True,
     "sections": ["dailystore", "kingdomstore"],
     "notify_on_failure": True,
+    "domain": "",  # 绑定域名（向导写入，明文非机密；Caddy on-demand ask 与状态页自检用）
     "email": {
         "smtp_host": "",
         "smtp_port": 465,
@@ -227,3 +232,65 @@ def guess_smtp(email_address: str) -> dict:
     if domain in SMTP_GUESS:
         return dict(SMTP_GUESS[domain])
     return {"smtp_host": f"smtp.{domain}" if domain else "", "smtp_port": 465, "security": "ssl"}
+
+
+# ---- 绑定域名（M4.5：向导写入 settings.domain，供 Caddy on-demand ask 与状态页自检） ----
+
+# 单段域名：字母数字开头结尾，中间可含连字符，≤63 字符（正则上限 63：1+61+1）
+_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def normalize_bound_domain(raw: str) -> str:
+    """规范化并校验用户提交的绑定域名；非法抛 ValueError（M4.5 决策 6）。
+
+    规则：trim → 小写 → 带 scheme/端口/路径时经 urlsplit 取 hostname → 去末尾点 →
+    校验：至少 2 段、每段 [a-z0-9-] 且 ≤63、总长 ≤253、拒绝裸 IP
+    （Let's Encrypt 不给裸 IP 发证书，直连 IP 用户本就不该绑定）。
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        raise ValueError("域名为空")
+    if "//" not in text:
+        text = f"http://{text}"  # 统一经 urlsplit 剥离端口/路径/凭据
+    try:
+        host = urlsplit(text).hostname or ""
+    except ValueError as exc:
+        raise ValueError(f"域名格式不正确：{exc}") from exc
+    host = host.rstrip(".")
+    if not host or "." not in host:
+        raise ValueError("域名至少需要两段（如 push.example.com）")
+    if len(host) > 253:
+        raise ValueError("域名总长超过 253 字符")
+    for label in host.split("."):
+        if len(label) > 63 or not _DOMAIN_LABEL_RE.fullmatch(label):
+            raise ValueError(f"域名段 {label!r} 非法")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("不能绑定裸 IP 地址（证书无法签发），请留空改用直连")
+    return host
+
+
+def seed_domain_from_env() -> bool:
+    """旧部署迁移种子：serve 启动时若尚未绑定域名且环境变量 DOMAIN 非空，写入 settings（决策 4）。
+
+    仅在真正发生写入时返回 True；种入后 .env 的 DOMAIN 即可移除。
+    环境变量值非法时跳过并告警，不阻塞启动。
+    """
+    env_domain = os.getenv("DOMAIN", "").strip()
+    if not env_domain:
+        return False
+    settings = load_settings()
+    if settings.get("domain"):
+        return False
+    try:
+        domain = normalize_bound_domain(env_domain)
+    except ValueError as exc:
+        logger.warning("忽略环境变量 DOMAIN=%r：非法域名（%s）", env_domain, exc)
+        return False
+    settings["domain"] = domain
+    save_settings(settings)
+    logger.info("已从环境变量 DOMAIN 迁移绑定域名：%s（.env 中该变量现在可以删除）", domain)
+    return True
