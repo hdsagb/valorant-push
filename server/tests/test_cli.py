@@ -24,7 +24,7 @@ def _run(args: list[str], data_dir: Path, input: str | None = None) -> subproces
 def test_version_flag(tmp_path: Path):
     result = _run(["--version"], tmp_path)
     assert result.returncode == 0
-    assert "0.4.0" in result.stdout
+    assert "0.4.1" in result.stdout
 
 
 def test_push_now_without_accounts_is_clean_skip(tmp_path: Path):
@@ -116,4 +116,4 @@ def test_main_no_args_invokes_serve(data_dir, monkeypatch):
 
 def test_version_bumped():
     from push_server import __version__
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.4.1"
