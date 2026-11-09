@@ -284,7 +284,7 @@ async def api_test_channel(request: web.Request) -> web.Response:
         # 防止页面被构造后把邮件凭据发到任意主机：只允许已保存的服务器或常见邮箱服务商
         host = settings["email"]["smtp_host"].strip().lower()
         saved_host = config.load_settings()["email"]["smtp_host"].strip().lower()
-        known_hosts = {item[0] for item in config.SMTP_GUESS.values()}
+        known_hosts = {item["smtp_host"] for item in config.SMTP_GUESS.values()}
         if host != saved_host and host not in known_hosts:
             return web.json_response(
                 {

@@ -483,3 +483,42 @@ def test_api_status_smoke_after_login(web_client_factory):
     assert resp.status == 200
     assert resp.data["account_count"] == 1
     assert resp.data["user_id_masked"] == "***0001"  # 服务器版掩码字段（不落明文 user_id）
+
+
+# ============================================================
+# M4 部署回归：/api/test-channel 邮件分支曾 500
+# server config 的 SMTP_GUESS 值为 dict，web.py 沿用个人版 tuple 下标取法 → KeyError: 0
+# ============================================================
+
+def test_test_channel_email_with_saved_host_not_500(web_client_factory, monkeypatch):
+    from push_server import config
+    from push_server.channels import ChannelError
+    from push_server.channels import email as email_channel
+
+    _setup_password()
+    config.save_settings(
+        {
+            "channel": "email",
+            "email": {
+                "username": "me@qq.com",
+                "password": "authcode",
+                "to": "me@qq.com",
+                "smtp_host": "smtp.qq.com",
+            },
+        }
+    )
+
+    async def fake_send(settings):
+        raise ChannelError("email", "stub")
+
+    monkeypatch.setattr(email_channel, "send_test", fake_send)
+
+    client = _login(web_client_factory)
+    token = _csrf_of(client)
+    resp = client.post(
+        "/api/test-channel",
+        json={"channel": "email", "draft": {}},
+        headers={**RW, "X-CSRF-Token": token},
+    )
+    assert resp.status == 400  # 修复前：500（KeyError: 0）
+    assert resp.data.get("ok") is False
