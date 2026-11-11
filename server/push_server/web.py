@@ -1,7 +1,8 @@
 # 来源：拷贝自 app/web.py @ cd5e2d2（个人版 v1.1.0，含 M2 凭证包导出功能），随后按
 # 《服务器版 M3 实施计划》Task 3 改造表裁剪——移除桌面专属项与扫码登录，
-# 扫码卡片替换为凭证导入卡片（复用 credpack.import_accounts）。两版 UI 同源、独立演进。
-"""服务器版管理界面（Web 向导：凭证导入 / 渠道与推送设置 / 账号管理）。"""
+# 扫码卡片替换为凭证导入卡片（复用 credpack.import_accounts）。
+# M6 起恢复扫码登录：login.py 会话 + 三个端点 + 卡片 1（两版 UI 同源、独立演进）。
+"""服务器版管理界面（Web 向导：扫码绑定 / 凭证导入 / 渠道与推送设置 / 账号管理）。"""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,7 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from . import __version__, accounts, auth, config, credpack, paths, pipeline, scheduler
+from . import __version__, accounts, auth, config, credpack, login, paths, pipeline, scheduler
 from .channels import ChannelError
 from .channels import email as email_channel
 from .channels import wecom as wecom_channel
@@ -274,6 +275,31 @@ async def api_credentials_import(request: web.Request) -> web.Response:
         {"ok": True, "message": message, "added": result["added"],
          "updated": result["updated"], "skipped": result["skipped"]}
     )
+
+
+@routes.post("/api/login/start")
+async def api_login_start(request: web.Request) -> web.Response:
+    body = await request.json()
+    session = await login.start("wechat" if body.get("method") == "wechat" else "qq")
+    return web.json_response(session.snapshot())
+
+
+@routes.get("/api/login/status")
+async def api_login_status(_: web.Request) -> web.Response:
+    session = login.current()
+    if not session:
+        return web.json_response({"state": "idle", "message": ""})
+    return web.json_response(session.snapshot())
+
+
+@routes.get("/api/qr")
+async def api_qr(_: web.Request) -> web.StreamResponse:
+    session = login.current()
+    if not session or not session.qr_path or not session.qr_path.exists():
+        return web.json_response({"ok": False, "message": "二维码不存在"}, status=404)
+    response = web.FileResponse(session.qr_path)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @routes.get("/api/settings")
@@ -734,9 +760,23 @@ INDEX_HTML = r'''<!doctype html>
   <p class="hint" id="domainMsg" hidden></p>
 
   <div class="grid">
+    <section class="card" id="cardLogin">
+      <h2>1 · 登录游戏账号 <span class="tag">国服</span></h2>
+      <p class="hint">用手机 QQ 或微信扫码绑定，凭证加密保存在服务器数据目录。登录失效后，在下方账号列表点「重新扫码」即可恢复。</p>
+      <div class="seg" id="loginTabs">
+        <button data-method="qq" class="active">QQ 扫码</button>
+        <button data-method="wechat">微信扫码</button>
+      </div>
+      <button class="action primary" id="loginBtn">生成登录二维码</button>
+      <div class="qrbox hidden" id="qrBox">
+        <img id="qrImg" alt="登录二维码">
+        <p id="qrMsg"></p>
+      </div>
+    </section>
+
     <section class="card">
-      <h2>1 · 导入游戏账号 <span class="tag">国服</span></h2>
-      <p class="hint">在个人版「已绑定账号」卡片点「导出凭证包」生成 .vpcred 文件，再在此导入。凭证包只在导入时解密使用，不会保存在服务器上。</p>
+      <h2>2 · 导入凭证包</h2>
+      <p class="hint">推荐使用上方扫码绑定。从个人版迁移时：在个人版「已绑定账号」卡片点「导出凭证包」生成 .vpcred 文件，再在此导入。凭证包只在导入时解密使用，不会保存在服务器上。</p>
       <label class="field"><span>凭证包文件（.vpcred）</span><input id="importFile" type="file" accept=".vpcred"></label>
       <label class="field"><span>凭证包口令</span><input id="importPass" type="password" placeholder="导出时设置的口令"></label>
       <button class="action primary" id="importBtn">导入账号</button>
@@ -745,13 +785,13 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>2 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
+      <h2>3 · 已绑定账号 <span class="tag" id="accCount">0/10</span></h2>
       <p class="hint">最多可绑定 10 个账号。推送时会合并成一条消息，并按账号名分区，方便区分。</p>
       <div class="acc-list" id="accList"><div class="acc-empty">还没有绑定账号</div></div>
     </section>
 
     <section class="card">
-      <h2>3 · 选择推送渠道</h2>
+      <h2>4 · 选择推送渠道</h2>
       <div class="seg" id="channelTabs">
         <button data-channel="email" class="active">邮件（推荐）</button>
         <button data-channel="wecom">企业微信</button>
@@ -804,7 +844,7 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>4 · 推送设置</h2>
+      <h2>5 · 推送设置</h2>
       <label class="field" style="max-width:180px"><span>每天推送时间</span><input id="pushTime" type="time"></label>
       <div class="checks">
         <label><input type="checkbox" id="secDaily" checked>每日商店</label>
@@ -821,7 +861,7 @@ INDEX_HTML = r'''<!doctype html>
     </section>
 
     <section class="card">
-      <h2>5 · 立即推送</h2>
+      <h2>6 · 立即推送</h2>
       <p class="hint">先保存设置并测试渠道，成功后可以立刻推送一次确认效果。</p>
       <button class="action primary" id="pushBtn">现在推送一次</button>
       <div class="last" id="lastBox">暂无推送记录</div>
@@ -849,7 +889,7 @@ INDEX_HTML = r'''<!doctype html>
 <div class="toast" id="toast"></div>
 
 <script>
-const state = { channel: 'email', loginMethod: 'qq', status: null, nameTarget: null, publicIp: '' };
+const state = { channel: 'email', loginMethod: 'qq', status: null, nameTarget: null, publicIp: '', poll: null, qrKey: '', accountPromptKey: '' };
 const $ = (id) => document.getElementById(id);
 const val = (id) => ($(id) ? $(id).value.trim() : '');
 
@@ -939,6 +979,9 @@ function fillSettings(s) {
 
   document.querySelectorAll('#channelTabs button').forEach((b) => {
     b.classList.toggle('active', b.dataset.channel === state.channel);
+  });
+  document.querySelectorAll('#loginTabs button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.method === state.loginMethod);
   });
   $('emailPane').classList.toggle('hidden', state.channel !== 'email');
   $('wecomPane').classList.toggle('hidden', state.channel !== 'wecom');
@@ -1034,7 +1077,7 @@ function renderStatus(s) {
   const banner = $('banner');
   const lines = [];
   if (s.auth_expired) {
-    lines.push('登录已失效：每日推送会暂停，请重新扫码登录。');
+    lines.push('登录已失效：每日推送已暂停。请在「登录游戏账号」卡片重新扫码，或点账号列表里的「重新扫码」。');
   } else if (s.expired_accounts && s.expired_accounts.length) {
     lines.push('以下账号登录已失效，推送时会跳过：' + s.expired_accounts.join('、'));
   }
@@ -1097,6 +1140,12 @@ function renderAccounts(list) {
 
     item.appendChild(main);
     item.appendChild(renameBtn);
+    if (acc.auth_expired) {
+      const rescanBtn = document.createElement('button');
+      rescanBtn.textContent = '重新扫码';
+      rescanBtn.addEventListener('click', () => startRescan(acc));
+      item.appendChild(rescanBtn);
+    }
     item.appendChild(removeBtn);
     box.appendChild(item);
   });
@@ -1218,6 +1267,87 @@ function switchChannel(channel) {
   $('wecomPane').classList.toggle('hidden', channel !== 'wecom');
 }
 
+// ---- 扫码登录（M6，状态机与个人版同构）----
+function stopPolling() {
+  if (state.poll) {
+    clearInterval(state.poll);
+    state.poll = null;
+  }
+}
+
+function applyLogin(snapshot) {
+  if (!snapshot) return;
+  if (snapshot.state === 'starting' || snapshot.state === 'waiting') {
+    $('qrBox').classList.remove('hidden');
+    $('qrMsg').textContent = snapshot.message || '请扫码';
+    if (snapshot.has_qr) {
+      const key = snapshot.method + ':' + snapshot.message;
+      if (key !== state.qrKey) {
+        state.qrKey = key;
+        $('qrImg').src = '/api/qr?t=' + Date.now();
+      }
+    }
+  } else if (snapshot.state === 'success') {
+    stopPolling();
+    $('qrMsg').textContent = '登录成功';
+    $('loginBtn').disabled = false;
+    const account = snapshot.account;
+    const key = account ? account.id + ':' + (account.updated ? '1' : '0') : '';
+    toast(snapshot.message || '登录成功', 'ok');
+    setTimeout(() => $('qrBox').classList.add('hidden'), 1500);
+    if (account && key !== state.accountPromptKey) {
+      state.accountPromptKey = key;
+      // 重绑（updated）已有名字，不弹命名框；新账号弹一次（同一会话不重复弹）
+      const skip = account.updated || sessionStorage.getItem('valpush_named_' + account.id);
+      loadAll().then(() => { if (!skip) openNameModal(account, true); });
+    } else {
+      loadAll();
+    }
+  } else if (snapshot.state === 'failed' || snapshot.state === 'timeout') {
+    stopPolling();
+    $('qrMsg').textContent = snapshot.message || '登录失败';
+    $('loginBtn').disabled = false;
+    toast(snapshot.message || '登录失败', 'err');
+  }
+}
+
+async function startLogin() {
+  $('loginBtn').disabled = true;
+  $('qrBox').classList.remove('hidden');
+  state.qrKey = '';
+  $('qrImg').removeAttribute('src');
+  $('qrMsg').textContent = '正在生成二维码…';
+  try {
+    const snapshot = await api('/api/login/start', {
+      method: 'POST',
+      body: JSON.stringify({ method: state.loginMethod })
+    });
+    applyLogin(snapshot);
+    stopPolling();
+    state.poll = setInterval(async () => {
+      try {
+        applyLogin(await api('/api/login/status'));
+      } catch (e) {
+        stopPolling();
+      }
+    }, 1500);
+  } catch (err) {
+    toast('生成二维码失败：' + err.message, 'err');
+    $('loginBtn').disabled = false;
+  }
+}
+
+// 失效账号一键重绑：预选对应登录方式的 tab，滚到卡片 1 并自动开始扫码
+function startRescan(acc) {
+  const method = acc.login_type === 'wechat' ? 'wechat' : 'qq';
+  state.loginMethod = method;
+  document.querySelectorAll('#loginTabs button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.method === method);
+  });
+  $('cardLogin').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  startLogin();
+}
+
 // 检测本机出口 IP：仅由「检测 IP」按钮显式触发，页面只显示打码结果
 async function detectPublicIp() {
   $('publicIp').textContent = '检测中…';
@@ -1325,6 +1455,14 @@ $('ipRefresh').addEventListener('click', () => detectPublicIp());
 $('ipCopy').addEventListener('click', copyPublicIp);
 $('saveBtn').addEventListener('click', saveAll);
 $('pushBtn').addEventListener('click', pushNow);
+
+$('loginTabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  state.loginMethod = btn.dataset.method;
+  document.querySelectorAll('#loginTabs button').forEach((b) => b.classList.toggle('active', b === btn));
+});
+$('loginBtn').addEventListener('click', startLogin);
 
 $('domainCheckBtn').addEventListener('click', async () => {
   const msg = $('domainMsg');

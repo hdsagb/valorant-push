@@ -53,9 +53,13 @@ class WebClient:
     def request(self, method: str, path: str, **kwargs):
         async def _do():
             resp = await self._client.request(method, path, **kwargs)
-            text = await resp.text()
+            raw = await resp.read()
             try:
-                data = json.loads(text)
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None  # 二进制响应（如 /api/qr 的 PNG），只断言 status/headers
+            try:
+                data = json.loads(text) if text is not None else None
             except ValueError:
                 data = None
             return SimpleNamespace(

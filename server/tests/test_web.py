@@ -59,12 +59,6 @@ def test_export_route_removed(web_routes_client):
     assert resp.status == 404
 
 
-def test_login_routes_removed(web_routes_client):
-    assert web_routes_client.post("/api/login/start", json={"method": "qq"}).status == 404
-    assert web_routes_client.get("/api/login/status").status == 404
-    assert web_routes_client.get("/api/qr").status == 404
-
-
 def test_autostart_routes_removed(web_routes_client):
     assert web_routes_client.get("/api/autostart").status == 404
     assert web_routes_client.post("/api/autostart", json={"enabled": True}).status == 404
@@ -87,21 +81,33 @@ def test_index_keeps_core_sections(web_client_factory):
         assert anchor in resp.text
 
 
-def test_index_drops_removed_sections(web_client_factory):
+def test_index_drops_desktop_sections(web_client_factory):
+    """M2 裁剪的桌面专属项仍不在页面里（M6 只恢复了扫码卡片）。"""
     _setup_password()
     client = _login(web_client_factory)
     resp = client.get("/")
     assert resp.status == 200
-    for absent in (
+    for absent in ("exportBtn", "exportModal", "autoStart", "openDirBtn"):
+        assert absent not in resp.text
+
+
+def test_index_has_scan_login_card(web_client_factory):
+    """M6：扫码登录恢复为卡片 1，含 tab / 二维码区 / 状态机与轮询引用。"""
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.get("/")
+    assert resp.status == 200
+    for anchor in (
+        "loginTabs",
         "loginBtn",
+        "qrBox",
         "qrImg",
-        "exportBtn",
-        "exportModal",
-        "autoStart",
-        "openDirBtn",
+        "qrMsg",
+        "startRescan",
+        "/api/login/start",
         "/api/login/status",
     ):
-        assert absent not in resp.text
+        assert anchor in resp.text
 
 
 def test_index_renders_session_csrf(web_client_factory):
@@ -128,8 +134,7 @@ def test_build_app_exists():
 
 
 def test_import_is_clean():
-    """import web 不应触发个人版登录/autostart 相关模块加载。"""
-    assert "push_server.login" not in sys.modules
+    """import web 不应触发桌面专属模块（autostart）；M6 起 login 属于服务器版正常依赖。"""
     assert "push_server.autostart" not in sys.modules
 
 
@@ -662,3 +667,99 @@ def test_domain_check_probes_and_classifies(web_client_factory, monkeypatch):
         assert resp.data["state"] == state
         assert resp.data["ok"] is (state == "ok")
         assert resp.data["message"] == payload["message"]
+
+
+# ============================================================
+# M6 扫码登录：/api/login/start · /api/login/status · /api/qr
+# （会话编排本身在 test_login.py，这里只测 Web 端点与鉴权）
+# ============================================================
+
+import asyncio  # noqa: E402
+
+from push_server import login as login_module  # noqa: E402
+
+
+class _FakeSession:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeApp:
+    """只实现 QQ 二维码生成 + 挂起的轮询：不触网，会话停在 waiting。"""
+
+    DEFAULT_LOGIN_U1_URL = "https://graph.qq.com/oauth2.0/unittest"
+
+    def __init__(self, png: Path):
+        self._png = png
+        self.session = _FakeSession()
+
+    async def generate_qq_qr_code(self):
+        return {
+            "qr_path": str(self._png),
+            "session": self.session,
+            "ptqrtoken": "t",
+            "login_sig": "s",
+            "u1_url": "u",
+            "login_url": "l",
+            "pt_openlogin_data": "o",
+            "aegis_uid": "a",
+        }
+
+    async def wait_for_qq_login_result(self, **kwargs):
+        await asyncio.Event().wait()  # 挂起直到会话被取消
+
+    async def generate_wechat_qr_code(self):
+        return None
+
+
+@pytest.fixture
+def _qr_png(data_dir):
+    paths.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    png = paths.TEMP_DIR / "qr-test.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    return png
+
+
+def test_login_scan_flow_routes(web_routes_client, monkeypatch, _qr_png):
+    monkeypatch.setattr(login_module, "_new_app", lambda: _FakeApp(_qr_png))
+    try:
+        resp = web_routes_client.get("/api/login/status")
+        assert resp.status == 200 and resp.data["state"] == "idle"
+
+        resp = web_routes_client.post("/api/login/start", json={"method": "qq"})
+        assert resp.status == 200
+        assert resp.data["state"] == "waiting"
+        assert resp.data["has_qr"] is True
+        assert "QQ" in resp.data["message"]
+
+        resp = web_routes_client.get("/api/login/status")
+        assert resp.data["state"] == "waiting" and resp.data["has_qr"] is True
+
+        resp = web_routes_client.get("/api/qr")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("image/png")
+        assert resp.headers["Cache-Control"] == "no-store"
+    finally:
+        login_module.reset()
+    assert web_routes_client.get("/api/qr").status == 404  # reset 后无二维码
+
+
+def test_login_scan_endpoints_require_session(web_client_factory):
+    """扫码三端点不进 SAFE_API_PATHS，未登录一律 401。"""
+    client = web_client_factory(web.build_app())
+    assert client.get("/api/login/status", allow_redirects=False).status == 401
+    assert client.get("/api/qr", allow_redirects=False).status == 401
+    resp = client.post(
+        "/api/login/start", json={"method": "qq"}, headers=RW, allow_redirects=False
+    )
+    assert resp.status == 401
+
+
+def test_login_start_requires_csrf(web_client_factory):
+    _setup_password()
+    client = _login(web_client_factory)
+    resp = client.post("/api/login/start", json={"method": "qq"}, headers=RW)
+    assert resp.status == 403  # 写接口缺 X-CSRF-Token
