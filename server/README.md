@@ -145,7 +145,8 @@ docker compose up -d
 - 建议在 `.env` 中固定 `IMAGE_TAG`（如 `0.5.0`）而非盲追 `latest`，升级时按版本号平滑推进。
 - 外部反代形态（章节 5.1）只升级应用容器：`docker compose pull push_server` + `docker compose up -d push_server`。
 - **0.4.0 → 0.4.1 注意**：Caddyfile / docker-compose.yml 已改为 on-demand TLS + ask 形态。`git pull && docker compose pull && docker compose up -d` 后需再执行 **`docker compose restart caddy`**（bind mount 挂载的 Caddyfile 内容变化不会自动重建容器）；重启前旧配置仍然有效，无中断窗口。升级后 serve 启动会把 `.env` 的 `DOMAIN` 自动种入设置（`settings.json` 的 `domain` 字段，向导/自检共用），确认已生效后即可从 `.env` 删除该变量。
-- **0.4.1 → 0.5.0 注意**：纯应用层增量（新增定时推送最终失败通知 `notify.py`、scheduler 重试用尽接入、安全自查测试、网页 QQ / 微信扫码绑定与失效一键重绑、改名 / 解绑端点修复），Caddyfile / compose 编排未变——`git pull && docker compose pull && docker compose up -d` 即可，**无需** `docker compose restart caddy`；向导、域名绑定与状态页「检查域名」均不受影响。数据无迁移：旧 `accounts.json` / `settings.json` 原样兼容（`settings.json` 首次读取自动补 `login_method` 默认值）。`.env` 的 `IMAGE_TAG` 示例已更新为 `0.5.0`（沿用固定 tag 的话记得同步改）。
+- **0.4.1 → 0.5.0 注意**：纯应用层增量（新增定时推送最终失败通知 `notify.py`、scheduler 重试用尽接入、安全自查测试），Caddyfile / compose 编排未变——`git pull && docker compose pull && docker compose up -d` 即可，**无需** `docker compose restart caddy`；向导、域名绑定与状态页「检查域名」均不受影响。`.env` 的 `IMAGE_TAG` 示例已更新为 `0.5.0`（沿用固定 tag 的话记得同步改）。
+- **0.5.0 → 0.6.0 注意（M6 扫码登录）**：管理界面新增网页 QQ / 微信扫码绑定与凭证失效一键重绑（原「个人版导出凭证包 → 服务器版导入」路径保留可用），并修复账号改名 / 解绑接口恒 404 的问题。Caddyfile / compose 编排未变——`git pull && docker compose pull && docker compose up -d` 即可，**无需** `docker compose restart caddy`。数据无迁移：旧 `accounts.json` / `settings.json` 原样兼容（`settings.json` 首次读取自动补 `login_method` 默认值）。发布 `0.6.0` 镜像后，`.env` 固定 `IMAGE_TAG` 的记得同步改。
 
 ## 9. 维护说明
 
