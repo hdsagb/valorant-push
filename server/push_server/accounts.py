@@ -87,18 +87,26 @@ def update_same_user(user_id: str, credentials: dict, login_type: str) -> bool:
     return updated
 
 
-def rename(account_id: str, name: str) -> None:
+def rename(account_id: str, name: str) -> dict | None:
+    """改名：返回改后的账号（找不到返回 None，此时不落盘）。"""
     store = _read_store()
     for account in store["accounts"]:
         if account["id"] == account_id:
             account["name"] = name
-    _write_store(store)
+            _write_store(store)
+            return account
+    return None
 
 
-def remove(account_id: str) -> None:
+def remove(account_id: str) -> bool:
+    """解绑：返回是否实际删除（找不到返回 False）。"""
     store = _read_store()
-    store["accounts"] = [a for a in store["accounts"] if a["id"] != account_id]
+    remaining = [a for a in store["accounts"] if a["id"] != account_id]
+    if len(remaining) == len(store["accounts"]):
+        return False
+    store["accounts"] = remaining
     _write_store(store)
+    return True
 
 
 def mark_expired(account_id: str, expired: bool = True) -> None:

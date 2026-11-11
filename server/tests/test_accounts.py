@@ -39,10 +39,22 @@ def test_add_same_user_updates_existing(data_dir: Path):
 
 def test_rename_and_remove(data_dir: Path):
     account = accounts.add({"userId": "u1", "tid": "t"}, "qq")
-    accounts.rename(account["id"], "小号")
+    renamed = accounts.rename(account["id"], "小号")
+    assert renamed is not None and renamed["name"] == "小号"
     assert accounts.all()[0]["name"] == "小号"
-    accounts.remove(account["id"])
+    assert accounts.remove(account["id"]) is True
     assert accounts.count() == 0
+
+
+def test_rename_missing_returns_none(data_dir: Path):
+    accounts.add({"userId": "u1", "tid": "t"}, "qq")
+    assert accounts.rename("nonexistent", "X") is None
+
+
+def test_remove_missing_returns_false(data_dir: Path):
+    accounts.add({"userId": "u1", "tid": "t"}, "qq")
+    assert accounts.remove("nonexistent") is False
+    assert accounts.count() == 1
 
 
 def test_mark_expired_and_all_expired(data_dir: Path):
