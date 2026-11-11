@@ -171,6 +171,8 @@ data/
 
 需要 Python 3.10+（Windows）。
 
+> **维护提醒（R4）**：本程序与服务器版（`server/`）共享腾讯商店接口的 vendored 脚本，接口变更需双版本同步修复（先修个人版、验证通过后同步服务器版）；服务器版部署见 `server/README.md`。
+
 ```bash
 pip install -r requirements.txt
 python -m app                # 托盘 + 设置面板

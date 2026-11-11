@@ -142,15 +142,42 @@ docker compose up -d
 
 - 数据在命名卷中保留，升级不丢数据；**升级前建议先按章节 6 备份**。
 - 会话仅存内存，升级重启后需重新登录管理界面。
-- 建议在 `.env` 中固定 `IMAGE_TAG`（如 `0.4.0`）而非盲追 `latest`，升级时按版本号平滑推进。
+- 建议在 `.env` 中固定 `IMAGE_TAG`（如 `0.5.0`）而非盲追 `latest`，升级时按版本号平滑推进。
 - 外部反代形态（章节 5.1）只升级应用容器：`docker compose pull push_server` + `docker compose up -d push_server`。
 - **0.4.0 → 0.4.1 注意**：Caddyfile / docker-compose.yml 已改为 on-demand TLS + ask 形态。`git pull && docker compose pull && docker compose up -d` 后需再执行 **`docker compose restart caddy`**（bind mount 挂载的 Caddyfile 内容变化不会自动重建容器）；重启前旧配置仍然有效，无中断窗口。升级后 serve 启动会把 `.env` 的 `DOMAIN` 自动种入设置（`settings.json` 的 `domain` 字段，向导/自检共用），确认已生效后即可从 `.env` 删除该变量。
+- **0.4.1 → 0.5.0 注意**：纯应用层增量（新增定时推送最终失败通知 `notify.py`、scheduler 重试用尽接入、安全自查测试），Caddyfile / compose 编排未变——`git pull && docker compose pull && docker compose up -d` 即可，**无需** `docker compose restart caddy`；向导、域名绑定与状态页「检查域名」均不受影响。`.env` 的 `IMAGE_TAG` 示例已更新为 `0.5.0`（沿用固定 tag 的话记得同步改）。
 
 ## 9. 维护说明
 
 - 腾讯商店接口属未公开接口，存在变更可能；变更时需个人版 / 服务器版**双版本同步修复**（接口层为 vendored 脚本整文件拷贝机制，见 `push_server/vendor/` 各文件头部标注）。
 - 日志查看：`docker compose logs -f push_server`，或命名卷内 `/data/app.log`（滚动 2MB × 3 份）。
 - 推送渠道：邮件（SMTP）与企业微信自建应用；企业微信要求把服务器出口 IP 加入「企业可信 IP」，IP 校验失败（60020）时自动回退邮件渠道（需已配置邮件）。
+
+## 9.5 灰度观察与风控应对（R1）
+
+> 新部署或每次大版本升级后，与个人版并行运行一段观察期（建议 1–2 周），每日核对下列信号。
+
+**监测信号（每日核对，共 4 项）**：
+
+1. 推送是否准点送达（对照设置的推送时间）；
+2. 日志无 4xx / 风控类错误签名（`docker compose logs push_server` / `/data/app.log`）；
+3. 渲染图片正常（无方块 / 缺失，CJK 字体 0.4.0 起内置）；
+4. 个人版停止推送后无双端并发迹象（同一账号只在服务器版启用定时）。
+
+任一异常 → 暂停（`docker compose stop push_server`）并对照《风险对策详解.md》处置。
+
+**观察记录表模板**（复制到自己的笔记中按天填写）：
+
+| 日期 | 准点 Y/N | 渠道 | 失败次数 | 备注 |
+| --- | --- | --- | --- | --- |
+|  |  |  |  |  |
+
+**Plan B 指引**：异常持续时暂停服务器版定时推送（管理界面关闭定时开关，或 `docker compose stop push_server`），参照《风险对策详解.md》Plan B 章节处置；账号凭证失效走「需要重新登录」通知的引导重导（个人版重新导出凭证包 → 服务器版导入）。
+
+**通知语义说明**：两类通知可能先后到达，属预期、不互相抑制——
+
+- **凭证失效通知**：推送过程中即时发出（某账号凭证过期时），引导重新导入凭证；
+- **定时推送最终失败通知**：当日推送重试 3 次全部用尽后发出，报告当日结果与原因，可到管理界面查看详情或手动重试。同一自然日只发一次（按天去重，次日自动恢复）；主渠道发送失败自动改用另一渠道（需已配置）。
 
 ## 10. 常见问题
 
