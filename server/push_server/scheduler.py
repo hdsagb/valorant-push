@@ -15,7 +15,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from . import accounts, config, pipeline
+from . import accounts, config, notify, pipeline
 from .models import zone
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,8 @@ async def tick(now: datetime | None = None) -> None:
             last_push_ok=False,
             last_error=str(exc),
         )
+        if _attempts >= MAX_ATTEMPTS:  # M5：重试用尽 → 最终失败通知（模块内按天去重）
+            await notify.notify_push_failure(settings, str(exc), _attempts)
 
 
 async def loop() -> None:
