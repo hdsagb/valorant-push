@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "sections": ["dailystore", "kingdomstore"],
     "notify_on_failure": True,
     "domain": "",  # 绑定域名（向导写入，明文非机密；Caddy on-demand ask 与状态页自检用）
+    "login_method": "qq",  # 最近一次扫码登录方式（M6，仅决定扫码页默认选中的 tab；apply_update 白名单不含它，扫码成功时由 login 模块直写）
     "email": {
         "smtp_host": "",
         "smtp_port": 465,

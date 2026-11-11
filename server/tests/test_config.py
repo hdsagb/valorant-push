@@ -23,7 +23,7 @@ def test_normalize_coerces_types():
     assert settings["sections"] == ["dailystore"]
     assert settings["email"]["smtp_port"] == 465
     assert settings["email"]["security"] == "ssl"
-    assert "login_method" not in settings  # 服务器版无扫码登录配置项
+    assert settings["login_method"] == "qq"  # M6：扫码默认 tab（apply_update 白名单外，login 模块直写）
 
 
 def test_settings_secrets_encrypted_on_disk(data_dir: Path):
