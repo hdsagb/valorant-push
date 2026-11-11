@@ -168,3 +168,19 @@ docker compose up -d
 首次发布后，镜像包默认为**私有**，其他机器拉取需要 `docker login ghcr.io`。建议改为公开（镜像不含任何用户数据，仅代码产物）：
 
 GitHub 仓库 → **Packages** → `valorant-push-server` → **Package settings** → **Danger Zone** → **Change visibility** → **Public**。
+
+## 12. 安全自查清单（部署机人工核对）
+
+> 对应《风险对策详解.md》R8 九项。前 8 项内生能力已由代码/镜像保证，此处给部署机逐条验证命令；带「运营侧」标注的项需在服务器上人工核对。自动化部分（日志与状态文件无明文凭证）见 `server/tests/test_security.py`。
+
+| # | 条目 | 验证方式与预期 |
+| --- | --- | --- |
+| 1 | SSH 仅密钥登录 | 服务器上 `grep -E "^PasswordAuthentication" /etc/ssh/sshd_config` → `no`（运营侧） |
+| 2 | 系统自动安全更新 | `systemctl is-active unattended-upgrades` → `active`（运营侧） |
+| 3 | 容器非 root | `docker compose exec push_server id` → `uid=1000(app)` |
+| 4 | data/ 权限 0700 | `docker compose exec push_server stat -c %a /data` → `700` |
+| 5 | 端口仅 80/443 + SSH | 云安全组控制台逐条核对，无多余放行端口（运营侧） |
+| 6 | Web/日志无明文凭证 | `python -m pytest server/tests/test_security.py -v` 全绿 + 管理界面走查（导入/渠道卡片不回显明文凭证，仅 `*_set` 标记） |
+| 7 | data/ 定期备份 | 按章节 6 命令演练一次备份 + 恢复（运营侧） |
+| 8 | 日志滚动生效 | `docker compose exec push_server ls /data` → 有 `app.log`，滚动后见 `app.log.1`（单文件 ≤ 2MB，共 3 份） |
+| 9 | 升级不盲追 latest | `.env` 固定 `IMAGE_TAG`（见 `.env.example` 注释），升级前核对目标版本号（运营侧） |
